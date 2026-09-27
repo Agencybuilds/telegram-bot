@@ -150,6 +150,16 @@ export interface BotConfig extends StellarConfig {
    */
   healthStaleMs: number;
   /**
+   * Wall-clock budget for retrying the startup RPC `getHealth()` probe.
+   * `0` means a single attempt with no retries.
+   */
+  startupHealthDeadlineMs: number;
+  /**
+   * Delay between failed startup RPC health attempts (capped by remaining
+   * deadline). Ignored when `startupHealthDeadlineMs` is `0`.
+   */
+  startupHealthRetryMs: number;
+  /**
    * How long a graceful shutdown waits for an in-flight cycle before flushing
    * cursor state and giving up on it. `0` skips the wait entirely.
    */
@@ -192,6 +202,9 @@ const DEFAULTS = {
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  // Retry RPC getHealth at boot for up to 30s (Testnet blips / deploy races).
+  startupHealthDeadlineMs: 30_000,
+  startupHealthRetryMs: 1_000,
   // Long enough for an in-flight read to finish and its cursors to land, short
   // enough that a deploy is never held open by a wedged RPC.
   shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -457,6 +470,17 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    // 0 = single attempt (no retries) for the startup RPC probe.
+    startupHealthDeadlineMs: c.int(
+      "STARTUP_HEALTH_DEADLINE_MS",
+      DEFAULTS.startupHealthDeadlineMs,
+      0,
+    ),
+    startupHealthRetryMs: c.int(
+      "STARTUP_HEALTH_RETRY_MS",
+      DEFAULTS.startupHealthRetryMs,
+      0,
+    ),
     shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
