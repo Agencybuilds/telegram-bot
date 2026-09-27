@@ -11,6 +11,7 @@ import { Bot, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 
 import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
 export { previewMessage } from "./notifications/format.js";
 import { formatProvenanceSummary, networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
@@ -102,6 +103,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
       (status.notificationsDropped
         ? ` · dropped during shutdown ${status.notificationsDropped}`
         : ""),
+    `Feature flags: ${escapeMd(formatFeatureFlags(config.featureFlags))}`,
     "",
     "*Watching*",
   ];

@@ -45,6 +45,10 @@ import {
   MOCK_SQUAD_CONTRACT_ID,
 } from "./stellar/mock-constants.js";
 
+import {
+  parseNotificationFeatureFlags,
+  type NotificationFeatureFlags,
+} from "./notifications/featureFlags.js";
 /**
  * The environment as it was before the `.env` file was merged in.
  *
@@ -133,6 +137,8 @@ export interface BotConfig extends StellarConfig {
   lockFile: string;
   statusFile: string;
   maxNotificationsPerCycle: number;
+  /** Coarse notification feature flags (see NOTIFY_* env vars). */
+  featureFlags: NotificationFeatureFlags;
   /** Append-only JSONL audit trail (see src/audit.ts). Empty disables it. */
   auditFile: string;
   /**
@@ -444,6 +450,13 @@ export function loadConfig(): BotConfig {
   const c = collector(resolveProfileDefaults());
   const stellar = stellarFrom(c);
 
+  const featureFlagsParsed = parseNotificationFeatureFlags({
+    NOTIFY_ENABLED: read("NOTIFY_ENABLED"),
+    NOTIFY_MARKET: read("NOTIFY_MARKET"),
+    NOTIFY_SQUAD: read("NOTIFY_SQUAD"),
+  });
+  for (const problem of featureFlagsParsed.problems) c.problems.push(problem);
+
   const config: BotConfig = {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
@@ -462,6 +475,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    featureFlags: featureFlagsParsed.flags,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
     auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
     // 0 is the documented escape hatch: no redelivery suppression.

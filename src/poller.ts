@@ -62,6 +62,7 @@ import {
   type InstanceLockHandle,
 } from "./instanceLock.js";
 import { explorerKeyboard, formatEvent, formatPlainTextEvent, safeErrorMessage } from "./notifications/format.js";
+import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import {
@@ -1151,6 +1152,16 @@ export function createPoller(deps: PollerDeps) {
             (event.payload.reason
               ? ` (${boundedLabel(event.payload.reason, 160)})`
               : ""),
+        );
+        continue;
+      }
+
+      if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        console.log(
+          `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
+            `at ledger ${event.ledger} (NOTIFY_* flags)`,
         );
         continue;
       }

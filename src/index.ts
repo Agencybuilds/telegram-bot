@@ -17,6 +17,7 @@ import {
   loadConfig,
   networkLabel,
 } from "./config.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
@@ -109,6 +110,7 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
   console.log(`[boot] audit file   ${config.auditFile}`);
   console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
