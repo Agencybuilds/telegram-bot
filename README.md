@@ -448,6 +448,19 @@ Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
 [docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
 
+For local restart and regression checks without Testnet or Telegram credentials,
+seed that file with a deterministic fixture:
+
+```bash
+npm run seed:cursor                 # writes ./data/cursor.json (refuses overwrite)
+npm run seed:cursor -- --force      # replace an existing file
+npm run seed:cursor -- --empty      # null cursors (file present, cold resume)
+npm run seed:cursor -- --out /tmp/cursor.json
+```
+
+The seeder uses the same write-then-rename discipline as the poller, never reads
+bot tokens or signing keys, and refuses cursor values that look like secrets.
+
 If the file exists but is corrupt (truncated JSON, wrong `version`, or a
 non-object `targets` map), the poller renames it to
 `CURSOR_FILE.corrupt.<ISO-timestamp>` and cold-starts. That keeps the bad file
@@ -733,6 +746,8 @@ src/
   audit-cli.ts             entrypoint for `npm run audit`
   instanceLock.ts          exclusive process lock for the cursor owner
   status.ts                machine-readable status snapshot (allowlisted, bounded)
+  dev/
+    seedCursor.ts          credential-free local cursor seeder (npm run seed:cursor)
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
@@ -791,6 +806,7 @@ truth for IaC; follow Railway's migration guide when the time comes.
 ## Development checks
 
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run seed:cursor` to write a local cursor fixture.
 
 ### Lockfile reproducibility
 
