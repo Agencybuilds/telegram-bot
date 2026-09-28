@@ -25,18 +25,26 @@ import {
   type AuditFileSummary,
   type AuditLog,
 } from "./audit.js";
+import {
+  AUDIT_CLI_HINT,
+  COMMAND_DESCRIPTIONS,
+  HELP_INTRO,
+  HELP_TITLE,
+  PAUSE_MESSAGES,
+  RESUME_MESSAGES,
+} from "./i18n.js";
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 const COMMANDS = [
-  { command: "start", description: "What this bot does", operatorOnly: false },
-  { command: "help", description: "Show help", operatorOnly: false },
-  { command: "status", description: "Last-seen ledger and watched contracts", operatorOnly: false },
-  { command: "audit", description: "Operator only: audit report (redacted, bounded)", operatorOnly: true },
-  { command: "contracts", description: "Contract ids and explorer links", operatorOnly: false },
-  { command: "health", description: "Health assessment and operational readiness", operatorOnly: false },
-  { command: "preview", description: "Preview channel notification formatting", operatorOnly: false },
-  { command: "pause", description: "Operator only: pause new scans", operatorOnly: true },
-  { command: "resume", description: "Operator only: resume polling now", operatorOnly: true },
+  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
+  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
+  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
+  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
+  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
+  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
+  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
+  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
+  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
 ] as const;
 
 function visibleCommands(config?: BotConfig) {
@@ -47,9 +55,9 @@ function visibleCommands(config?: BotConfig) {
 
 function helpMessage(config: BotConfig): string {
   return [
-    "*Mimir notifier*",
+    HELP_TITLE,
     "",
-    escapeMd("I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts."),
+    escapeMd(HELP_INTRO),
     "",
     ...visibleCommands(config).map(({ command, description }) =>
       escapeMd(`/${command} — ${description}`),
@@ -70,8 +78,6 @@ function ago(timestamp: number | null, nowMs: number = Date.now()): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
-const AUDIT_COMMAND_HINT = "See `npm run audit -- --help` for the standalone report tool.";
-
 /**
  * Render the audit report for Telegram. The report is plain text — audit lines
  * are arbitrary redacted strings and MarkdownV2 would mangle them — so nothing
@@ -81,7 +87,7 @@ const AUDIT_COMMAND_HINT = "See `npm run audit -- --help` for the standalone rep
 function renderAuditForTelegram(summary: AuditFileSummary, tail: number): string {
   const header = `*Audit* — ${summary.file}`;
   const report = renderAuditReport(summary, { tail });
-  return `${header}\n\n${report}\n\n${AUDIT_COMMAND_HINT}`;
+  return `${header}\n\n${report}\n\n${AUDIT_CLI_HINT}`;
 }
 
 function cursorPreview(cursor: string | null): string {
@@ -255,22 +261,22 @@ export function contractsMessage(config: BotConfig): string {
 export function pauseMessage(result: PollerPauseResult): string {
   switch (result) {
     case "paused":
-      return "*Polling paused*\nThe current scan may finish, but no new cycle will start\\. Cursors were not changed\\.";
+      return PAUSE_MESSAGES.paused;
     case "already-paused":
-      return "*Polling is already paused*";
+      return PAUSE_MESSAGES.alreadyPaused;
     case "stopped":
-      return "*Polling cannot pause* — the process is stopping\\.";
+      return PAUSE_MESSAGES.stopped;
   }
 }
 
 export function resumeMessage(result: PollerResumeResult): string {
   switch (result) {
     case "resumed":
-      return "*Polling resumed*\nThe next scan starts now\\. Cursors were not changed\\.";
+      return RESUME_MESSAGES.resumed;
     case "already-running":
-      return "*Polling is already running*";
+      return RESUME_MESSAGES.alreadyRunning;
     case "stopped":
-      return "*Polling cannot resume* — the process is stopping\\.";
+      return RESUME_MESSAGES.stopped;
   }
 }
 
