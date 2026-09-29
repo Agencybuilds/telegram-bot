@@ -12,7 +12,9 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -226,7 +228,10 @@ export function buildHealthReport(
       cursorRewinds: poller.cursorRewinds ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
-        ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
+        ? {
+            at: new Date(poller.lastError.at).toISOString(),
+            message: redactText(poller.lastError.message),
+          }
         : null,
       pendingFlush: poller.pendingFlush === true,
       lastFlushAt: iso(poller.lastFlushAt ?? null),
@@ -312,7 +317,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
 
   // Failures after listen (e.g. client aborts) must not take down the notifier.
   server.on("error", (err) => {
-    console.error(`[health] server error: ${err instanceof Error ? err.message : err}`);
+    console.error(`[health] server error: ${safeErrorMessage(err)}`);
   });
 
   server.listen(config.healthPort, config.healthHost);

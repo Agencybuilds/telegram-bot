@@ -10,6 +10,7 @@
  * phone lock screen.
  */
 
+import { redactText } from "../redact.js";
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
@@ -68,19 +69,17 @@ function describeError(error: unknown): string {
  * bot token into logs and status messages.
  */
 export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
-  let message = describeError(error);
-  for (const secret of secrets) {
-    if (secret) message = message.split(secret).join("[REDACTED]");
-  }
+  // Collapse first, so the bound below is applied to the text that will
+  // actually be shown rather than to remote whitespace.
+  const collapsed = describeError(error).replace(/\s+/g, " ").trim();
 
-  // Also cover a Telegram token embedded in an upstream error when the
-  // caller does not have the configured value (for example in a unit test).
-  message = message.replace(
-    /(?<![A-Za-z0-9_-])\d{6,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
-    "[REDACTED]",
-  );
+  // Caller-supplied secrets, the secrets registered at boot, and the
+  // credential shapes in `redact.ts`: the same rules the audit trail
+  // applies, so an error cannot carry a seed strkey, a token, or a URL's
+  // credentials into a log, `/status`, or `/health`.
+  const message = redactText(collapsed, { secrets });
 
-  const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
+  const compact = message.trim() || "unknown error";
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
 
