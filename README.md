@@ -477,6 +477,15 @@ The poller now recovers from exactly that case, without guessing:
   do not delete or replace the persistent cursor volume to force readiness.
   `GET /health/live` stays `200` for supervisors that need process liveness
   independently of readiness.
+- A cursor that simply **never advances** is the other half of the story: the
+  scan keeps succeeding, so no error counter moves, yet the walk is behind the
+  tip and never closes the gap. After `CURSOR_STALL_CYCLES` (5) such cycles with
+  a lag of at least `CURSOR_STALL_MIN_LAG_LEDGERS` (2) ledgers, the poller logs
+  a `CURSOR STALLED` warning once, `/status` gains a `cursor stalled:` line, and
+  `/health` reports `cursorStalled` per target and becomes `degraded`. Sitting
+  at or within a ledger of the tip is healthy idling and never counts, and a
+  cold start's first cursor is progress, not a stall. Nothing is rewritten: the
+  cursor file is left intact and the bot keeps retrying.
 - The miss is logged as a bounded ledger count (`cursor is N ledger(s) below the
   retained floor`), never as a raw RPC payload, and `/status` and `GET /health`
   expose `cursorRewinds` plus the per-target `rewindFromLedger` while it lasts.
