@@ -1591,6 +1591,8 @@ export function createPoller(deps: PollerDeps) {
         console.error(`[poller] also failed to deliver repeated-failures alert: ` + errorMessage(alertErr));
       }
     }
+
+    return { sent: sentThisCycle, failed, skipped };
   }
 
       // Pace sends to stay under Telegram's ~20 messages/minute limit.
@@ -1937,8 +1939,20 @@ export function createPoller(deps: PollerDeps) {
       }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
-        // Advance last — see the failure policy at the top of this file.
-        if (scan.cursor) current.cursor = scan.cursor;
+        // The opaque cursor covers the whole returned page, so it cannot be
+        // committed per event. Commit after processing the page, including
+        // deliberate drops, to avoid replaying a permanent Telegram failure.
+        if (scan.cursor) {
+          current.cursor = scan.cursor;
+          if (delivery.failed > 0 || delivery.skipped > 0) {
+            console.warn(
+              `[poller] ${target.source}: committed cursor after partial delivery ` +
+                `(sent=${delivery.sent}, failed=${delivery.failed}, skipped=${delivery.skipped})`,
+            );
+          }
+        }
+        // Persist each target checkpoint before scanning the next contract.
+        await saveCursors();
       } catch (err) {
         const message = errMessage(err);
         current.lastError = message;
