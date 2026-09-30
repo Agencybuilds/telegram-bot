@@ -218,6 +218,18 @@ export function formatLastEvent(config: StellarConfig, event: DecodedEvent): str
   );
 }
 
+/** Format the latest observed event, including events with no notification template. */
+export function formatLastEvent(config: StellarConfig, event: DecodedEvent): string {
+  const notification = formatEvent(config, event);
+  if (notification !== null) return notification;
+
+  const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+  return (
+    `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
+    `This event has no notification summary\.\n${footer(config, event)}`
+  );
+}
+
 /**
  * The headline for an event, or null when this bot has nothing to say about it.
  *
