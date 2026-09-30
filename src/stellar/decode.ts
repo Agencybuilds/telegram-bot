@@ -1031,6 +1031,20 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     };
   }
 
+  if (!event || !Array.isArray(event.topic)) {
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "missing or invalid topic array" },
+    };
+  }
+
+  if (event.topic.length === 0) {
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "empty topic array" },
+    };
+  }
+
   let eventName = "";
   try {
     if (!event || typeof event !== "object") {
