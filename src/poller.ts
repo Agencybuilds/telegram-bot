@@ -472,7 +472,10 @@ const MAX_ERROR_MSG_BYTES = 200;
  */
 const BACKOFF_MULTIPLIER = 10;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 
 function errMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -2260,6 +2263,21 @@ export function createPoller(deps: PollerDeps) {
     /** Persist buffered audit entries now (used on shutdown). */
     flushAuditFile(): Promise<void> {
       return flushAudit();
+    },
+
+    /** Run one polling cycle directly and await its completion. */
+    async cycle(): Promise<void> {
+      await cycle();
+    },
+
+    /** Ensure cursors are loaded and run one polling cycle directly. */
+    async pollOnce(): Promise<void> {
+      if (status.startedAt === 0) {
+        await loadCursors();
+        status.running = true;
+        status.startedAt = Date.now();
+      }
+      await cycle();
     },
   };
 }
