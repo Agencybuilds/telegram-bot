@@ -258,7 +258,21 @@ export interface SendOptions {
   maxSendRetries?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
+  /**
+   * Per-attempt timeout for a single Telegram send, in milliseconds. A send
+   * that does not settle within this window is treated as a failed attempt so
+   * one hung HTTP request cannot stall the whole poll cycle. Defaults to
+   * {@link DEFAULT_SEND_TIMEOUT_MS}.
+   */
+  sendTimeoutMs?: number;
 }
+
+/**
+ * Default per-attempt Telegram send timeout. Chosen to be comfortably longer
+ * than a healthy Telegram round trip but short enough that a hung socket is
+ * abandoned well before the next poll cycle would be due.
+ */
+export const DEFAULT_SEND_TIMEOUT_MS = 15_000 as const;
 
 export interface PollerDeps {
   config: BotConfig;

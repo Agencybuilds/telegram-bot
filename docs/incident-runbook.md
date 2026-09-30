@@ -135,6 +135,12 @@ does not hold the cursor back because replaying every missed notification could
 create an unbounded backlog or flood a recovered chat. The log reports the
 sent/failed/skipped counts for that commit.
 
+Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
+`10000`). A send that exceeds this deadline is aborted and counted as a failure
+for that event; the poller continues with the remaining events in the page and
+commits the cursor under the normal rules. The timeout applies per send, not to
+the whole cycle, so a single slow request cannot stall the poller indefinitely.
+
 The Stellar chain remains the authoritative record.
 
 ## Stale or corrupt cursor
@@ -148,6 +154,8 @@ The Stellar chain remains the authoritative record.
   / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
 * `GET /health` returns `503` and a target has `cursorStale: true`, even if the
   other watched contract is scanning successfully.
+* `/status` shows send errors clustered around a single slow event, with the
+  remaining events in the same page still delivered.
 
 ### Recovery
 
@@ -156,6 +164,10 @@ preserve the quarantined copy for investigation.
 
 A syntactically valid cursor that Soroban rejects as stale is first checked
 against a fresh `getHealth()`:
+
+Timing out an individual send does not change cursor behavior: the cursor still
+advances only after the returned page is processed, and a timed-out send is
+treated exactly like any other failed send.
 
 * If the cursor's ledger is **strictly below** `oldestLedger`, the position it
   points at is already unrecoverable, so the poller drops it and rescans from
@@ -297,6 +309,11 @@ If Telegram rate limits are observed:
 2. Check `/status` for send errors.
 3. Do not disable the notification cap to compensate.
 4. Allow subsequent polling cycles to continue normally.
+
+If sends are timing out rather than being rate limited, confirm
+`TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment's
+network path before raising it; the default is chosen to keep a single slow
+send from delaying the rest of the cycle.
 
 Do not manually replay large event ranges into Telegram.
 

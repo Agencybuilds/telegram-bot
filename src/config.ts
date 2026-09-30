@@ -170,12 +170,17 @@ export interface BotConfig extends StellarConfig {
    * cursor state and giving up on it. `0` skips the wait entirely.
    */
   shutdownTimeoutMs: number;
+  /** Wall-clock budget for a single Telegram send before it is abandoned. */
+  telegramSendTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
+export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -214,6 +219,9 @@ const DEFAULTS = {
   // Long enough for an in-flight read to finish and its cursors to land, short
   // enough that a deploy is never held open by a wedged RPC.
   shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  // Bounded so one wedged Telegram send cannot stall the poll loop; long
+  // enough for a normal API round-trip on a slow link.
+  telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
   channelPreviewMode: false,
 } as const;
 
@@ -496,6 +504,11 @@ export function loadConfig(): BotConfig {
       0,
     ),
     shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
+    telegramSendTimeoutMs: c.int(
+      "TELEGRAM_SEND_TIMEOUT_MS",
+      DEFAULTS.telegramSendTimeoutMs,
+      0,
+    ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
 
@@ -619,6 +632,7 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.

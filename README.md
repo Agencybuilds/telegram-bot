@@ -295,7 +295,14 @@ poller's cursor.
 
 **Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
 are logged at the progress level and not sent. Unknown or malformed events are
-logged and skipped. Send failures are counted as skipped and do not abort the
+logged and skipped. Send failures are retried on the next cycle; each individual
+Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default 15000) so a
+stalled or rate-limited Telegram endpoint cannot wedge the poller. A send that
+exceeds the timeout is counted as a failure, logged with the target and event
+name (never the token or payload), and the cursor is not advanced past it, so
+the event is retried after a restart. Cursor files remain version-1 and
+compatible with existing deployments; no configuration change is required to
+keep current behavior.ailures are counted as skipped and do not abort the
 run. No bot token or private key ever appears in progress output or the JSON
 report.
 
