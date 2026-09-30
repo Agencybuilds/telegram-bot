@@ -344,6 +344,12 @@ const CONSECUTIVE_FAILURE_THRESHOLDS = [5, 10, 25, 50, 100];
   circuitBreakerOptions?: CircuitBreakerOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Async delay used for send-spacing and retry back-off.
+   * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
+   * avoid waiting for real wall-clock time.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface ShutdownOptions {
@@ -859,7 +865,7 @@ export async function waitForStartupHealth(
   attempts: number;
 }> {
   const now = options.now ?? Date.now;
-  const sleepFn = options.sleep ?? sleep;
+  const sleepFn = options.sleep ?? defaultSleep;
   const deadlineMs = Math.max(0, options.deadlineMs);
   const retryMs = Math.max(0, options.retryMs);
   const startedAt = now();
@@ -928,6 +934,7 @@ async function sendWithRetry(
   botToken: string,
   opts?: SendOptions,
   shouldRetry: () => boolean = () => true,
+  sleep: (ms: number) => Promise<void> = defaultSleep,
 ): Promise<void> {
   let attempt = 0;
   const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
@@ -1520,7 +1527,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
+        await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping, sleep);
         status.notificationsSent += 1;
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
