@@ -138,6 +138,9 @@ export interface RawScan {
   timing: RpcTimingSummary;
 }
 
+const MAX_UINT32 = 4_294_967_295n;
+const MAX_UINT64 = 18_446_744_073_709_551_615n;
+
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
  * high 32 bits. Reading it lets the walk know it reached the end of the range
@@ -634,6 +637,14 @@ function summarize(event: DecodedEvent): string {
       if (isAdminPayload(p)) return `admin event ${p.name}`;
       return p.name;
   }
+}
+
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
 }
 
 async function main(): Promise<void> {
