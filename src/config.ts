@@ -386,6 +386,23 @@ function collector(profile: Record<string, string>) {
       return ids;
     },
 
+    /**
+     * Parse an optional TCP port number. Returns `null` when the env var is
+     * absent/empty (server disabled). Validates 1–65535 when present.
+     */
+    optionalPort(name: string): number | null {
+      const raw = read(name);
+      if (raw === undefined) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        problems.push(`${name} must be an integer port number (1–65535); got "${raw}"`);
+        return null;
+      }
+      if (parsed < 1 || parsed > 65_535) {
+        problems.push(`${name} must be between 1 and 65535; got ${parsed}`);
+        return null;
+      }
+      return parsed;
     optionalChatId(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       if (value === "") return value;

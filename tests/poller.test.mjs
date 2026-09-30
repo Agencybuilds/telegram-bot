@@ -1,5 +1,40 @@
 
 /**
+ * Poller unit tests.
+ *
+ * All tests use fake RPC and fake send implementations — no live Testnet or
+ * Telegram credentials are required or consulted. The fake RPC returns
+ * controlled scan results; the fake send records calls and can be made to
+ * reject.
+ */
+
+import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { createPoller } from "../dist/poller.js";
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const CONTRACT_A = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+const CONTRACT_B = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQMF4";
+
+function makeConfig(overrides = {}) {
+  return {
+    botToken: "REDACTED",
+    chatId: "-1001234567890",
+    marketContractId: CONTRACT_A,
+    squadContractId: CONTRACT_B,
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    pollIntervalMs: 999_999, // prevent automatic re-poll in tests
+    startLookbackLedgers: 60,
+    cursorFile: "/tmp/test-cursor-UNUSED.json",
+    maxNotificationsPerCycle: 3,
+    interSendDelayMs: 0, // no sleep in tests
  * Tests for src/poller.ts
  *
  * All I/O (filesystem, RPC, Telegram) is replaced by in-process fakes so no

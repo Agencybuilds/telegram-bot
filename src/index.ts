@@ -26,6 +26,8 @@ import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { createMetrics } from "./metrics.js";
+import type { MetricsServer } from "./metrics.js";
 import { boundText } from "./status.js";
 import { redactUrl, registerSecrets } from "./redact.js";
 
@@ -144,6 +146,26 @@ async function main(): Promise<void> {
     console.warn(`[boot] config       ${warning}`);
   }
 
+  // ── Metrics ────────────────────────────────────────────────────────────────
+  // Create the registry unconditionally; the HTTP server is only started when
+  // METRICS_PORT is configured. This means the poller always has a metrics
+  // object to call — no null checks needed there.
+  const metrics = createMetrics();
+
+  let metricsServer: MetricsServer | null = null;
+  if (config.metricsPort !== null) {
+    try {
+      metricsServer = await metrics.startServer(config.metricsPort);
+    } catch (err) {
+      // Metrics are optional. A port conflict or privilege error must not
+      // prevent the bot from starting — just log and continue.
+      console.error(
+        `[boot] metrics server failed to start on port ${config.metricsPort}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const server = createRpcServer(config);
 
   // Bounded retries before announcing readiness: a briefly unavailable RPC
@@ -165,6 +187,8 @@ async function main(): Promise<void> {
     throw new Error("telegram notifier not ready");
   };
 
+  const poller = createPoller({ config, server, send: (text) => notify(text), metrics });
+  const bot = createBot({ config, status: () => poller.status() });
   const audit = createAuditLog();
   audit.record(
     auditEntry("boot", {
@@ -227,6 +251,11 @@ async function main(): Promise<void> {
    * cold-ish resume bounded by the last completed cycle.
    */
   const shutdown = (signal: string) => {
+    console.log(`[shutdown] ${signal} received, stopping`);
+    poller.stop();
+    const stopBot = bot.stop().finally(() => process.exit(0));
+    const stopMetrics = metricsServer ? metricsServer.close() : Promise.resolve();
+    void Promise.all([stopBot, stopMetrics]);
     if (shuttingDown) {
       console.warn(`[shutdown] ${signal} received again during drain; forcing exit`);
       process.exit(signal === "SIGINT" ? 130 : 143);

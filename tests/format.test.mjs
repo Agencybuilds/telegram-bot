@@ -387,6 +387,33 @@ test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode i
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longQuestion = "Will ".repeat(100); // 500 chars
+  const event = {
+    source: "squad",
+    contractId: "squad",
+    ledger: 51,
+    txHash: "",
+    at: 0,
+    eventId: "51-0",
+    payload: {
+      name: "market_created",
+      marketId: 1,
+      captain: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
+      deadline: 1_800_000_000,
+      feeBps: 100,
+      question: longQuestion,
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  assert.ok(
+    !message.includes("Will ".repeat(50)),
+    "Question was not truncated in the notification output",
+  );
+});
+
+test("clip: summary field is bounded in claim_resolved notification", () => {
     explorerBaseUrl: "https://stellar.expert/explorer",
     channelPreviewMode: true,
   };
@@ -417,6 +444,32 @@ test("formatFallbackEvent formats actionable degraded event notification with re
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longSummary = "evidence ".repeat(100); // 900 chars
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 52,
+    txHash: "",
+    at: 0,
+    eventId: "52-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 3,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 95,
+      evidenceHash: "abc123",
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The raw summary should not appear verbatim past 200 chars in the output
+  assert.ok(
+    !message.includes("evidence ".repeat(30)),
+    "Summary was not truncated in the notification output",
+  );
+});
     explorerBaseUrl: "https://stellar.expert/explorer",
   };
   const event = {

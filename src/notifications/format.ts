@@ -131,6 +131,14 @@ function who(address: string): string {
   return `\`${escapeMd(shortAddress(address))}\``;
 }
 
+/**
+ * Truncate an unbounded contract String before it sizes a chat message.
+ *
+ * The category, question, and summary fields all come from remote contract
+ * state. A hard cap here means a crafted payload cannot push an unbounded
+ * string through to a Telegram message or to a log line.
+ */
+export function clip(text: string, max = 200): string {
 /** Truncate an unbounded contract String without splitting a Unicode code point. */
 function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
   const trimmed = text.trim();
