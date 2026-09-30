@@ -152,6 +152,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   if (status.lastError) {
     lines.push(
       "",
+      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(clipError(status.lastError.message))}`,
       `Last error \\(${ago(status.lastError.at, nowMs)}\\): ${escapeMd(status.lastError.message)}`,
     );
   }

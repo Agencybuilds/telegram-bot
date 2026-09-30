@@ -433,8 +433,27 @@ export function extractRetryAfterMs(err: unknown): number | null {
  */
 const MAX_FLOOR_REWINDS = 3;
 
+/**
+ * Maximum bytes of a remote error message to include in logs or status.
+ * An RPC or Telegram error body can be arbitrarily large; cap it so a status
+ * response or a log line is never the thing that takes the bot down.
+ */
+const MAX_ERROR_MSG_BYTES = 200;
+
+/**
+ * The backoff multiplier applied when MAX_CONSECUTIVE_FAILURES is reached.
+ * 10× pollIntervalMs means a 30 s interval becomes 5 minutes.
+ */
+const BACKOFF_MULTIPLIER = 10;
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function errMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  // Clip at the byte level so multi-byte sequences do not leave a broken
+  // character at the boundary.
+  if (Buffer.byteLength(raw, "utf8") <= MAX_ERROR_MSG_BYTES) return raw;
+  return `${Buffer.from(raw, "utf8").subarray(0, MAX_ERROR_MSG_BYTES - 1).toString("utf8")}…`;
 /**
  * Wait for `promise`, resolving `false` if `timeoutMs` elapses first.
  *
@@ -1042,18 +1061,31 @@ export function createPoller(deps: PollerDeps) {
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
-  async function loadCursors(): Promise<void> {
+  /**
+   * Try to parse and apply a cursor file from `filePath`.
+   * Returns true when a valid file was found, false when missing.
+   * Throws on a parse or structural error so the caller can decide.
+   */
+  async function applyCursorFile(filePath: string): Promise<boolean> {
     let raw: string;
     try {
-      raw = await readFile(config.cursorFile, "utf8");
+      raw = await readFile(filePath, "utf8");
     } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
-      );
-      return;
+      return false; // file missing — not an error, just absent
     }
 
+    const parsed = JSON.parse(raw) as CursorFile;
+    for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
+      const target = state.get(source as ContractSource);
+      if (!target) continue;
+      target.cursor = saved.cursor ?? null;
+      target.lastEventLedger = saved.lastEventLedger ?? null;
+    }
+    return true;
+  }
+
+  async function checkCursorAge(filePath: string): Promise<void> {
+    if (!config.cursorMaxAgeMs) return;
     try {
       const parsed = JSON.parse(raw) as Partial<CursorFile>;
 
@@ -1125,8 +1157,24 @@ export function createPoller(deps: PollerDeps) {
       const reason = errorMessage(err);
       await quarantineCorruptCursorFile(config.cursorFile, reason);
     }
+
+    console.log(
+      `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+        `${config.startLookbackLedgers} ledgers behind the tip`,
+    );
   }
 
+  async function saveCursors(): Promise<void> {
+    const payload: CursorFile = {
+      version: 1,
+      updatedAt: new Date(nowFn()).toISOString(),
+      targets: Object.fromEntries(
+        [...state.values()].map((t) => [
+          t.source,
+          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
+        ]),
+      ),
+    };
   /**
    * Record that in-memory cursor state has moved ahead of the file, so a
    * shutdown knows there is something to flush even if the cycle that moved it
@@ -1156,6 +1204,11 @@ export function createPoller(deps: PollerDeps) {
       const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
+      // Copy the committed file to the backup. `copyFile` is not atomic
+      // cross-filesystem, but the backup is always at least one generation
+      // older than the primary — a crash here leaves the primary intact.
+      const backupFile = `${config.cursorFile}.bak`;
+      await copyFile(config.cursorFile, backupFile);
       status.pendingFlush = false;
       status.lastFlushAt = now();
       pendingRewrite = false;
@@ -1545,6 +1598,7 @@ export function createPoller(deps: PollerDeps) {
     );
   }
 
+  async function runCycle(): Promise<void> {
   async function cycle(): Promise<number | void> {
     if (inFlight) return;
     inFlight = true;
@@ -1861,13 +1915,14 @@ export function createPoller(deps: PollerDeps) {
     if (stopped || paused || inFlight) return;
     let nextDelay = config.pollIntervalMs;
     try {
+      await runCycle();
       const delay = await cycle();
       if (typeof delay === "number" && delay > nextDelay) {
         nextDelay = delay;
       }
     } catch (err) {
-      // Belt and braces: `cycle` already swallows per-target failures, so this
-      // only fires on a bug. Either way the loop survives it.
+      // Belt and braces: `runCycle` already swallows per-target failures, so
+      // this only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
       metrics?.consecutiveFailures.set(status.consecutiveFailures);
       emitCircuitBreakerWarning();
@@ -1931,6 +1986,7 @@ export function createPoller(deps: PollerDeps) {
         await saveCursors("migration");
       }
       status.running = true;
+      status.startedAt = nowFn();
       status.startedAt = now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
@@ -2052,6 +2108,23 @@ export function createPoller(deps: PollerDeps) {
       return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
     },
 
+    /**
+     * Run exactly one poll cycle and wait for it to finish.
+     *
+     * Intended for tests: drive the poller cycle-by-cycle without relying on
+     * real timers or starting the loop. Safe to call while the loop is
+     * running too — `inFlight` ensures at most one cycle at a time.
+     */
+    runCycle,
+
+    /**
+     * Load cursor state from disk without starting the poll loop.
+     *
+     * Intended for tests that need to verify cursor-loading behaviour
+     * (backup promotion, stale detection) without the asynchronous loop
+     * race that `start()` introduces.
+     */
+    loadCursors,
     /** Machine-readable snapshot, same shape as the file on disk. */
     snapshot(): StatusSnapshot {
       return snapshot();
