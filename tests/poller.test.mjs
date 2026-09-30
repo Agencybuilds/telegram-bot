@@ -15,6 +15,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createPoller } from "../dist/poller.js";
+import { buildHealthReport } from "../dist/health.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

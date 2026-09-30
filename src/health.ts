@@ -99,6 +99,8 @@ export interface HealthReport {
       cursorStalled: boolean;
       hasError: boolean;
     }>;
+    persistentVolumeAvailable: boolean;
+    persistentVolumeError: string | null;
   };
   /**
    * Where configuration came from: each setting's name and the source that
@@ -248,6 +250,8 @@ export function buildHealthReport(
         cyclesWithoutAdvance: t.cyclesWithoutAdvance,
         hasError: t.lastError !== null,
       })),
+      persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
+      persistentVolumeError: poller.persistentVolumeError ?? null,
     },
     config: provenance,
   };

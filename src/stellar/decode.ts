@@ -404,6 +404,31 @@ function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
 }
 
+function decodeScVal(val: unknown): unknown {
+  if (val === null || val === undefined) return null;
+  if (typeof val === "string") {
+    try {
+      const scVal = xdr.ScVal.fromXDR(val, "base64");
+      return scValToNative(scVal);
+    } catch {
+      return val;
+    }
+  }
+  if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
+    try {
+      const scVal = xdr.ScVal.fromXDR(Buffer.from(val));
+      return scValToNative(scVal);
+    } catch {
+      return val;
+    }
+  }
+  try {
+    return native(val as xdr.ScVal);
+  } catch {
+    return val;
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -953,7 +978,6 @@ export const SQUAD_DECODERS: Record<string, SquadDecoderFn> = {
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-/** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
   if (!event || typeof event !== "object") return "";
   const raw: unknown = (event as { contractId?: unknown }).contractId;
@@ -992,6 +1016,20 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
  */
 export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
   const meta: EventMeta = safeMeta(source, event);
+
+  if (!event || !Array.isArray(event.topic)) {
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "missing or invalid topic array" },
+    };
+  }
+
+  if (event.topic.length === 0) {
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "empty topic array" },
+    };
+  }
 
   let eventName = "";
   try {
