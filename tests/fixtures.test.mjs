@@ -113,7 +113,7 @@ test("fixture claim_challenged reaches Telegram via fake notifier", async () => 
     },
   };
 
-  await createNotifier(fakeBot, catalog.config)(message);
+  await createNotifier(fakeBot)(catalog.config.chatId, message);
   assert.equal(sent.length, 1);
   assert.equal(sent[0][0], catalog.config.chatIds[0]);
   assert.equal(sent[0][1], message);

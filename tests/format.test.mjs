@@ -149,7 +149,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   };
 
   assert.equal(message, expectedMessage);
-  await createNotifier(fakeBot, config)(message);
+  await createNotifier(fakeBot)(config.chatId, message);
   assert.deepEqual(sent, [
     [
       config.chatIds[0],

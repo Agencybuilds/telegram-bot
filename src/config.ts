@@ -122,6 +122,11 @@ export interface StellarConfig {
   explorerBaseUrl: string;
 }
 
+export interface TelegramRoute {
+  chatId: string;
+  channelPreviewMode: boolean;
+}
+
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
@@ -178,6 +183,8 @@ export interface BotConfig extends StellarConfig {
   telegramSendTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /** Per-chat notification preferences. */
+  routes: TelegramRoute[];
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */

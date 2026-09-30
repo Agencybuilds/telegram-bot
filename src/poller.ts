@@ -1497,7 +1497,33 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      if (sentThisCycle >= config.maxNotificationsPerCycle) {
+        const routeConfig = { ...config, channelPreviewMode: route.channelPreviewMode };
+        const text = formatEvent(routeConfig, event);
+        
+        if (text === null) {
+          continue;
+        }
+        routeProcessed = true;
+
+        try {
+          // Use bounded retry for Telegram sends to handle transient failures
+          await sendWithRetry((t) => send(route.chatId, t), text, config.botToken);
+          status.notificationsSent += 1;
+          sentThisCycle += 1;
+        } catch (err) {
+          // All retries exhausted; drop the message but continue processing others.
+          status.notificationsFailed += 1;
+          failed += 1;
+          console.error(
+            `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} to chat ${route.chatId} after retries: ` +
+              errorMessage(err),
+          );
+        }
+
+        if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      }
+      
+      if (!routeProcessed) {
         status.eventsSkipped += 1;
         metrics?.eventsSkipped.inc();
         // Log clearly that the cap was reached, not just that an event was dropped.
