@@ -485,6 +485,12 @@ export interface SendExtra {
    * Bounded identifiers for fallback logging only. Optional; never sent.
    */
   eventRef?: { eventId?: string | undefined; ledger?: number | undefined; source?: string | undefined } | undefined;
+  /**
+   * Post the notification as a reply to this message, for chats that thread
+   * their notifications. Optional: omitted from the payload entirely when
+   * absent, so the send is byte-identical to the unthreaded one.
+   */
+  replyToMessageId?: number | undefined;
 }
 
 /**
@@ -549,6 +555,9 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       await bot.api.sendMessage(chatId, text, {
         ...TELEGRAM_OPTIONS,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
       });
       return;
     } catch (err) {
@@ -569,6 +578,9 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       await bot.api.sendMessage(chatId, fallback, {
         ...PLAIN_TEXT_OPTIONS,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
       });
     }
   };
