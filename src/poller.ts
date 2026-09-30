@@ -72,6 +72,7 @@ import { explorerKeyboard, formatEvent, formatPlainTextEvent, safeErrorMessage }
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
   eventCursorLedger,
   readContractEvents,
@@ -153,6 +154,12 @@ export interface PollerStatus {
   cursorRewinds: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /**
+   * Chain-tip cache counters for this process. Reset never zeroes them, so they
+   * describe the whole run: `hits` should be `cycles × (targets - 1)` while the
+   * cache is doing its job.
+   */
+  ledgerCache: { hits: number; misses: number };
   /** Absolute path of the exclusive instance lock, or null before acquire. */
   lockFile: string | null;
   /** Pid recorded in the lock while this process holds it. */
@@ -1029,6 +1036,7 @@ export function createPoller(deps: PollerDeps) {
     cursorRewinds: 0,
     consecutiveFailures: 0,
     lastError: null,
+    ledgerCache: { hits: 0, misses: 0 },
     lockFile: null,
     lockPid: null,
     pendingFlush: false,
@@ -1041,6 +1049,11 @@ export function createPoller(deps: PollerDeps) {
       lastFailureAt: null,
     },
   };
+
+  // One chain tip per poll cycle. An infinite TTL plus a `reset()` at the top
+  // of each cycle means the tip is fetched exactly once per cycle however many
+  // targets are watched, without a wall-clock expiry landing mid-cycle.
+  const ledgerCache = new LedgerCache({ ttlMs: Number.POSITIVE_INFINITY });
 
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
@@ -1638,6 +1651,10 @@ export function createPoller(deps: PollerDeps) {
     metrics?.pollCycles.inc();
     status.lastPollAt = now();
 
+    // A cycle gets a fresh view of the chain tip; every target in this cycle
+    // reuses it instead of each paying for its own `getHealth()`.
+    ledgerCache.reset();
+
     // ── Circuit breaker check ─────────────────────────────────────────────────────
     if (status.circuitBreaker.open) {
       const nowMs = now();
@@ -1692,6 +1709,7 @@ export function createPoller(deps: PollerDeps) {
           const previousCursor = current.cursor;
           const scan = await withTimeout(
             readContractEvents(server, target, {
+              ledgerTip: tip,
               // A pending floor rewind resumes by ledger, never by the stale
               // cursor the RPC already rejected (`cursor` and `startLedger` are
               // mutually exclusive in one request).
@@ -2151,7 +2169,11 @@ export function createPoller(deps: PollerDeps) {
     },
 
     status(): PollerStatus {
-      return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+      return {
+        ...status,
+        ledgerCache: ledgerCache.stats(),
+        targets: [...state.values()].map((t) => ({ ...t })),
+      };
     },
 
     /**

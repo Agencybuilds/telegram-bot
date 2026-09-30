@@ -50,6 +50,7 @@ import {
   validateLedgerWindow,
   type LedgerWindow,
 } from "./client.js";
+import type { LedgerTip } from "./ledger-cache.js";
 import {
   decodeEvent,
   dedupeEvents,
@@ -94,6 +95,13 @@ export interface ScanOptions {
    * disables deduplication. Defaults to {@link DEFAULT_DEDUP_WINDOW}.
    */
   dedupWindow?: number | undefined;
+  /**
+   * Chain tip cached by the caller for this poll cycle. When set the walk does
+   * not call `getHealth()`; the caller owns refreshing it per cycle (see
+   * {@link import("./ledger-cache.js").LedgerCache}). Omitted means a one-shot
+   * scan — the `scan` CLI, a test — fetches its own tip.
+   */
+  ledgerTip?: LedgerTip | undefined;
 }
 
 export interface RawScan {
