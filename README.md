@@ -34,7 +34,10 @@ it holds no keys and signs nothing.
 
 Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
-then skipped — they are logged, not posted.
+then skipped — they are retained as bounded `unknown` events and logged with
+their event name, ledger, and bounded decode reason, not posted. New event names
+and malformed XDR follow the same path, so they cannot stop polling or advance a
+log with an unbounded remote payload.
 
 ## Claim category filtering
 

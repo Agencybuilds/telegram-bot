@@ -602,6 +602,10 @@ export async function runAuditCli(): Promise<void> {
 function summarize(event: DecodedEvent): string {
   const p = event.payload;
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
+  const text = (value: string, max = 200): string => {
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+  };
   switch (p.name) {
     case "claim_created":
       return `claim #${p.claimId} created by ${shortAddress(p.creator)} [${p.category}]`;
