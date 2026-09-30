@@ -7,6 +7,8 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
+import type { UserFromGetMe } from "grammy/types";
+import { Bot, type Context } from "grammy";
 import { Bot, type Context, type CommandContext } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { performance } from "node:perf_hooks";
@@ -289,6 +291,8 @@ export function resumeMessage(result: PollerResumeResult): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  pause: () => PollerPauseResult;
+  resume: () => PollerResumeResult;
   /** Live in-memory audit window; renders immediately even before a flush. */
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
@@ -300,6 +304,11 @@ export interface BotDeps {
   botInfo?: UserFromGetMe;
   pause: () => PollerPauseResult;
   resume: () => PollerResumeResult;
+}
+
+function isOperator(ctx: Context, config: BotConfig): boolean {
+  const operatorId = config.operatorTelegramUserId;
+  return operatorId !== null && ctx.from?.id.toString() === operatorId;
 }
 
 /**
@@ -435,6 +444,10 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
 }
 
 export function createBot(deps: BotDeps): Bot {
+  const bot = new Bot(
+    deps.config.botToken,
+    deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
+  );
   const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
 
