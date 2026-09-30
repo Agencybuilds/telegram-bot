@@ -800,6 +800,13 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   wrong local clock stay distinguishable. The clock is saved with the cursors,
   so a restart resumes it instead of reporting `unknown`, and an event without
   a `ledgerClosedAt` never counts as a chain time.
+- **A repeating failure** is logged through a sampler: the first
+  `LOG_SAMPLE_MAX_PER_WINDOW` identical errors in a `LOG_SAMPLE_WINDOW_MS`
+  window print in full, later repeats are counted, and the line that opens the
+  next window reports how many were held back. An RPC that is down for hours
+  therefore costs a handful of lines instead of one per cycle. The running total
+  is exposed as `poller.suppressedLogs` on `/health`; `/status` still shows the
+  latest error verbatim.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
@@ -857,6 +864,30 @@ Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
 format is unchanged — a deployment that omits the new key gets the `10000` ms
 default.
 
+## Log sampling
+
+Operational errors are sampled so a long outage cannot drown the log. Per key —
+`scan:market`, `scan:squad`, and `cycle` — the first `LOG_SAMPLE_MAX_PER_WINDOW`
+identical lines inside a `LOG_SAMPLE_WINDOW_MS` window are printed in full.
+Further repeats are counted, and the line that opens the next window reports how
+many it held back (`suppressed N identical repeats in the previous 300s`). The
+running total is exposed as `poller.suppressedLogs` on `/health`, so a sampled
+log still accounts for every failure. Keys are independent: a noisy market
+contract cannot silence the squad contract's errors, and the text itself is
+still bounded and redacted exactly as before.
+
+Configuration (see `.env.example`):
+
+- `LOG_SAMPLE_MAX_PER_WINDOW` — full lines per key per window (default `3`; `1` logs only the first line of a run)
+- `LOG_SAMPLE_WINDOW_MS` — window length in milliseconds (default `300000`; minimum `1000`)
+
+Sampling is in-memory and resets on restart. It changes log volume only — never
+cursors, sends, retry counts, or the `/status` error text.
+
+**Failure modes:** the sampler is pure bookkeeping keyed by string, so it cannot
+throw into the poll loop. **Rollback:** omit both keys to keep defaults, or raise
+`LOG_SAMPLE_MAX_PER_WINDOW` until nothing is suppressed.
+
 ## Long-running operation
 
 The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
@@ -906,7 +937,7 @@ checks (default `http://127.0.0.1:8787`):
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
@@ -1011,6 +1042,7 @@ src/
   bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
   dedup.ts                 canonical event dedup keys (eventKey) + bounded window
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
+  log-sampler.ts           windowed suppression of repetitive error log lines
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
   replay-cli.ts            entrypoint for `npm run replay` (cursor-range replay)

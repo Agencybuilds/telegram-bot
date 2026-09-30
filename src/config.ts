@@ -238,6 +238,11 @@ const DEFAULTS = {
   // enough for a normal API round-trip on a slow link.
   telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
   channelPreviewMode: false,
+  logSampleMaxPerWindow: 3,
+  // ~10 default poll cycles of a down RPC, collapsed into one line plus a
+  // summary. Long enough not to hide a flapping error, short enough to bound
+  // an outage that lasts for hours.
+  logSampleWindowMs: 300_000,
 } as const;
 
 /**
@@ -630,6 +635,13 @@ export function loadConfig(): BotConfig {
       0,
     ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    logSampleMaxPerWindow: c.int(
+      "LOG_SAMPLE_MAX_PER_WINDOW",
+      DEFAULTS.logSampleMaxPerWindow,
+      1,
+    ),
+    // A window of 1ms is legal but pointless; 1s is the smallest useful unit.
+    logSampleWindowMs: c.int("LOG_SAMPLE_WINDOW_MS", DEFAULTS.logSampleWindowMs, 1_000),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

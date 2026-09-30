@@ -76,6 +76,8 @@ export interface HealthReport {
     /** Cursors automatically rewound to the RPC's retained floor this run. */
     cursorRewinds: number;
     consecutiveFailures: number;
+    /** Repetitive error lines summarized rather than printed since start. */
+    suppressedLogs: number;
     lastError: { at: string; message: string } | null;
     /**
      * In-memory cursor state that is not on disk yet. False after a successful
@@ -233,6 +235,7 @@ export function buildHealthReport(
       notificationsDropped: poller.notificationsDropped ?? 0,
       cursorRewinds: poller.cursorRewinds ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
+      suppressedLogs: poller.suppressedLogs ?? 0,
       lastError: poller.lastError
         ? {
             at: new Date(poller.lastError.at).toISOString(),

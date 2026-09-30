@@ -170,6 +170,11 @@ export interface PollerStatus {
   /** In-memory cursor state is newer than the persisted file. */
   pendingFlush: boolean;
   lastFlushAt: number | null;
+  /**
+   * Repetitive error lines withheld by the sampler since start. They are
+   * summarized in the log rather than dropped; surfaced here for `/status`.
+   */
+  suppressedLogs: number;
   targets: TargetState[];
   /** RPC circuit breaker state */
   circuitBreaker: {
@@ -1063,6 +1068,7 @@ export function createPoller(deps: PollerDeps) {
     lockPid: null,
     pendingFlush: false,
     lastFlushAt: null,
+    suppressedLogs: 0,
     targets: [],
     circuitBreaker: {
       open: false,
@@ -1919,7 +1925,8 @@ export function createPoller(deps: PollerDeps) {
           if (staleCursor) current.cursorStale = true;
           status.lastError = { at: currentTime, message: `${target.source}: ${message}` };
           audit.recordError(err, "cycle_failed", { source: target.source });
-          console.error(
+          logSampledError(
+            `scan:${target.source}`,
             `[poller] ${target.source} scan failed${staleCursor ? " (stale cursor)" : ""}: ${message}`,
           );
           if (staleCursor) {
@@ -2059,7 +2066,7 @@ export function createPoller(deps: PollerDeps) {
       status.lastError = { at: now(), message: errorMessage(err) };
       audit.recordError(err, "cycle_failed");
       await flushAudit();
-      console.error(`[poller] cycle threw: ${errorMessage(err)}`);
+      logSampledError("cycle", `[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
     if (stopped || paused) return;
