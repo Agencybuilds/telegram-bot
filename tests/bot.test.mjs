@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { auditEntry, createAuditLog } from "../dist/audit.js";
 import {
+  createNotifier,
   registerCommandHandlers,
   resumeMessage,
 } from "../dist/bot.js";
@@ -34,6 +35,8 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    webhookUrl: null,
+    telegramWebhookUrl: null,
     ...overrides,
   };
 }
