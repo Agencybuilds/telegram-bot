@@ -18,6 +18,12 @@ does not receive an explorer link. The original event is still decoded and the
 cursor follows the normal poller rules; truncation affects only the Telegram
 presentation, not chain data or persisted cursor state.
 
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
+
 ## Quick health check
 
 Run:
