@@ -104,6 +104,10 @@ export interface TargetState {
   cyclesWithoutAdvance: number;
   /** True once {@link CURSOR_STALL_CYCLES} non-advancing cycles have fired. */
   cursorStalled: boolean;
+  /** Number of consecutive RPC failures for this specific target. */
+  consecutiveFailures: number;
+  /** Timestamp (unix ms) before which this target will skip RPC scanning. */
+  nextEligibleAt: number | null;
 }
 
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
@@ -327,6 +331,8 @@ const CONSECUTIVE_FAILURE_THRESHOLDS = [5, 10, 25, 50, 100];
    */
   persistAudit?: boolean | undefined;
   sendOptions?: SendOptions;
+  /** Per-target RPC backoff configuration */
+  targetBackoffOptions?: TargetBackoffOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
@@ -359,6 +365,12 @@ export interface CircuitBreakerOptions {
   /** Milliseconds to wait before attempting to close the circuit */
   cooldownMs?: number;
 }
+
+/** Default maximum backoff in milliseconds for per-target RPC backoff. */
+const DEFAULT_TARGET_MAX_BACKOFF_MS = 60_000;
+
+/** Default backoff factor for per-target RPC backoff. */
+const DEFAULT_TARGET_BACKOFF_FACTOR = 2;
 
 /** Default number of consecutive RPC failures before opening the circuit. */
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
@@ -925,9 +937,9 @@ async function sendWithRetry(
       if (attempt >= maxRetries || !shouldRetry()) {
         throw err; // Exhausted retries, or a shutdown made waiting pointless
       }
-      
+
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
-      
+
       console.warn(
         `[poller] send attempt ${attempt} failed, retrying in ${delay}ms: ` +
           safeErrorMessage(err, [botToken]),
@@ -945,6 +957,9 @@ export function createPoller(deps: PollerDeps) {
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
+  const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
+  const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
+  const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
@@ -975,6 +990,8 @@ export function createPoller(deps: PollerDeps) {
         lastError: null,
         cyclesWithoutAdvance: 0,
         cursorStalled: false,
+        consecutiveFailures: 0,
+        nextEligibleAt: null,
       },
     ]),
   );
@@ -1646,6 +1663,15 @@ export function createPoller(deps: PollerDeps) {
         if (!current) continue;
         const previousFailed = current.lastError !== null;
 
+        // Per-target RPC backoff check: skip if in backoff window
+        if (current.nextEligibleAt !== null && currentTime < current.nextEligibleAt) {
+          const remainingMs = current.nextEligibleAt - currentTime;
+          console.log(
+            `[poller] ${target.source}: skipping RPC scan (in backoff for another ${Math.ceil(remainingMs / 1000)}s)`,
+          );
+          continue;
+        }
+
         try {
           const dedupWindow = dedup.get(target.source) ?? new EventDedupWindow(0);
           const rewinding = current.rewindFromLedger !== null;
@@ -1680,6 +1706,8 @@ export function createPoller(deps: PollerDeps) {
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
           current.cursorStale = false;
+          current.consecutiveFailures = 0;
+          current.nextEligibleAt = null;
           anyOk = true;
 
           if (previousFailed) {
@@ -1797,11 +1825,17 @@ export function createPoller(deps: PollerDeps) {
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
+          current.consecutiveFailures += 1;
+          const delayMs = Math.min(
+            targetInitialBackoff * Math.pow(targetBackoffFactor, current.consecutiveFailures - 1),
+            targetMaxBackoff,
+          );
+          current.nextEligibleAt = currentTime + delayMs;
           const message = errorMessage(err);
           const staleCursor = isStaleCursorError(message);
           current.lastError = message;
           if (staleCursor) current.cursorStale = true;
-          status.lastError = { at: now(), message: `${target.source}: ${message}` };
+          status.lastError = { at: currentTime, message: `${target.source}: ${message}` };
           audit.recordError(err, "cycle_failed", { source: target.source });
           console.error(
             `[poller] ${target.source} scan failed${staleCursor ? " (stale cursor)" : ""}: ${message}`,
