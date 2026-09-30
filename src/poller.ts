@@ -7,6 +7,8 @@
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
+ *  - Each contract is paced independently. A slow or failing contract does not
+ *    block the scanning of other contracts.
  *  - A scan cursor is committed after its returned page has been processed,
  *    even when delivery was partial. Unknown events, the per-cycle cap, and
  *    exhausted Telegram retries are deliberate drops. Holding the cursor back
@@ -1472,6 +1474,9 @@ export function createPoller(deps: PollerDeps) {
     let cycleFailures = 0;
 
     try {
+      // Pace each contract independently: scan them sequentially but do not let
+      // a failure in one block the others. This ensures that if the "squad"
+      // contract is unreachable, the "market" contract is still polled.
       for (const target of targets) {
         const current = state.get(target.source);
         if (!current) continue;
