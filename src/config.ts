@@ -115,6 +115,8 @@ export interface StellarConfig {
   network?: StellarNetwork;
   marketContractId: string;
   squadContractId: string;
+  marketContractVersion: string;
+  squadContractVersion: string;
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
@@ -324,6 +326,17 @@ function collector(profile: Record<string, string>) {
         );
       }
       return value;
+    },
+
+    contractVersion(name: string, fallback: string): string {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      const trimmed = raw.toLowerCase().trim();
+      if (!/^[a-z0-9_.-]+$/.test(trimmed)) {
+        problems.push(`${name} must be a valid version string (e.g. v1, v2); got "${raw}"`);
+        return fallback;
+      }
+      return trimmed;
     },
 
     url(name: string, fallback: string): string {

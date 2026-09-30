@@ -137,7 +137,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
 
   for (const target of status.targets) {
     lines.push(
-      `· mimir\\-${target.source} \`${target.contractId}\``,
+      `· mimir\\-${target.source} \\(${escapeMd(target.version ?? "v1")}\\) \`${target.contractId}\``,
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${cursorPreview(target.cursor)}\``,
     );
@@ -245,9 +245,17 @@ export function healthMessage(
 }
 
 export function contractsMessage(config: BotConfig): string {
-  const targets: Array<{ label: string; contractId: string }> = [
-    { label: "mimir\\-market", contractId: config.marketContractId },
-    { label: "mimir\\-squad", contractId: config.squadContractId },
+  const targets: Array<{ label: string; version: string; contractId: string }> = [
+    {
+      label: "mimir\\-market",
+      version: config.marketContractVersion ?? "v1",
+      contractId: config.marketContractId,
+    },
+    {
+      label: "mimir\\-squad",
+      version: config.squadContractVersion ?? "v1",
+      contractId: config.squadContractId,
+    },
   ];
 
   const lines: string[] = [
@@ -259,7 +267,7 @@ export function contractsMessage(config: BotConfig): string {
   for (const target of targets) {
     lines.push(
       "",
-      `*${target.label}*`,
+      `*${target.label}* \\(${escapeMd(target.version ?? "v1")}\\)`,
       `\`${escapeMd(target.contractId)}\``,
       `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
     );

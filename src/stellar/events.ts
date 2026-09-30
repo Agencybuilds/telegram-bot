@@ -317,17 +317,19 @@ export async function paginatedGetEvents(
 export interface WatchTarget {
   source: ContractSource;
   contractId: string;
+  version?: string;
 }
 
 export interface ContractScan extends Omit<RawScan, "events"> {
   source: ContractSource;
   contractId: string;
+  version: string;
   events: DecodedEvent[];
   /** Highest ledger among the returned events, or null when there were none. */
   lastEventLedger: number | null;
 }
 
-/** Scan one contract and decode everything it returned. */
+/** Scan one contract and decode everything it returned for the configured version. */
 export async function readContractEvents(
   server: rpc.Server,
   target: WatchTarget,
@@ -358,6 +360,7 @@ export async function readContractEvents(
   return {
     source: target.source,
     contractId: target.contractId,
+    version,
     events,
     cursor: scan.cursor,
     latestLedger: scan.latestLedger,
