@@ -301,7 +301,9 @@ Do not delete `/app/data` cursor state as part of a normal rollback.
 
 ## Rate limiting
 
-Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE` and spaced out.
+Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE`: each cycle
+reads one RPC page of that size, commits its page cursor, and then spaces sends
+out. A restart therefore replays at most one bounded page.
 
 If Telegram rate limits are observed:
 
