@@ -55,7 +55,7 @@ function explorerPart(value: string): string {
 /** Explorer link for a transaction hash, used in notification footers. */
 export function txExplorerUrl(config: StellarConfig, txHash: string): string {
   const hash = txHash.trim();
-  if (!hash) return "";
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/tx/${explorerPart(hash)}`;
 }
@@ -63,7 +63,7 @@ export function txExplorerUrl(config: StellarConfig, txHash: string): string {
 /** Explorer link for a classic / contract account. */
 export function accountExplorerUrl(config: StellarConfig, address: string): string {
   const id = address.trim();
-  if (!id) return "";
+  if (!id || !/^[GC][A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/account/${explorerPart(id)}`;
 }
@@ -71,7 +71,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
 /** Explorer link for a Soroban contract id, used by /contracts. */
 export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
   const id = contractId.trim();
-  if (!id) return "";
+  if (!id || !/^C[A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/contract/${explorerPart(id)}`;
 }

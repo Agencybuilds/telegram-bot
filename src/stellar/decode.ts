@@ -1062,6 +1062,8 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     if (payload) return { ...meta, payload } as DecodedEvent;
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const reason = msg.length > 256 ? `${msg.slice(0, 256)}…` : msg;
     return {
       ...meta,
       payload: {

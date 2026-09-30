@@ -219,9 +219,17 @@ export async function paginatedGetEvents(
   const dedup = new EventDedupWindow(opts.dedupWindow ?? DEFAULT_DEDUP_WINDOW);
   for (const id of opts.seenEventIds ?? []) dedup.add(id);
 
-  const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
-  let lastCursor: string | null = opts.cursor ?? null;
+  if (cursor) {
+    const cLedger = eventCursorLedger(cursor);
+    if (cLedger !== null && cLedger < oldestLedger) {
+      console.error(`[scanner] cursor ledger ${cLedger} is older than retained window ${oldestLedger}, discarding`);
+      cursor = undefined;
+    }
+  }
+
+  const events: rpc.Api.EventResponse[] = [];
+  let lastCursor: string | null = cursor ?? null;
   let previousCursor = "";
   let latestLedger = window.latestLedger;
   let truncated = false;
