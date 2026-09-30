@@ -56,6 +56,8 @@ function visibleCommands(config?: BotConfig) {
   );
 }
 
+export function helpMessage(config: BotConfig): string {
+  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
 function helpMessage(config: BotConfig): string {
   return [
     HELP_TITLE,
@@ -68,7 +70,7 @@ function helpMessage(config: BotConfig): string {
   ].join("\n");
 }
 
-const TELEGRAM_OPTIONS = {
+export const TELEGRAM_OPTIONS = {
   parse_mode: "MarkdownV2" as const,
   link_preview_options: { is_disabled: true },
 };
@@ -335,8 +337,13 @@ function isOperator(ctx: Context, config: BotConfig): boolean {
 const AUDIT_TAIL = 10;
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
-export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
-  const { config, status, pause, resume } = deps;
+export function registerCommandHandlers(
+  bot: Bot | { command: (name: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  const { config, status } = deps;
+  const pause = deps.pause ?? (() => "stopped");
+  const resume = deps.resume ?? (() => "stopped");
 
   const handlers: Record<typeof COMMANDS[number]["command"], (ctx: CommandContext<Context>) => Promise<void>> = {
     start: async (ctx) => {
@@ -450,6 +457,7 @@ export function createBot(deps: BotDeps): Bot {
   );
   const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
+  registerCallbackHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
