@@ -52,6 +52,8 @@ export interface HealthReport {
     stopping: boolean;
     channelPreviewMode: boolean;
     cycles: number;
+    /** Correlation ID for the most recently started poll cycle. */
+    lastCorrelationId: string | null;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
     latestLedger: number | null;
@@ -217,6 +219,7 @@ export function buildHealthReport(
       stopping: poller.stopping === true,
       channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
+      lastCorrelationId: poller.lastCorrelationId ?? null,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,

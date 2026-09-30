@@ -139,6 +139,8 @@ export interface PollerStatus {
   chainClockAt: number | null;
   startedAt: number;
   cycles: number;
+  /** Correlation ID for the most recently started poll cycle. */
+  lastCorrelationId: string | null;
   lastPollAt: number | null;
   lastSuccessAt: number | null;
   latestLedger: number | null;
@@ -1043,6 +1045,7 @@ export function createPoller(deps: PollerDeps) {
     chainClockAt: null,
     startedAt: 0,
     cycles: 0,
+    lastCorrelationId: null,
     lastPollAt: null,
     lastSuccessAt: null,
     latestLedger: null,
@@ -1213,7 +1216,7 @@ export function createPoller(deps: PollerDeps) {
     );
   }
 
-  async function saveCursors(): Promise<void> {
+  async function saveCursors(correlationId: string): Promise<void> {
     const payload: CursorFile = {
       version: 1,
       updatedAt: new Date(nowFn()).toISOString(),
@@ -1436,7 +1439,7 @@ export function createPoller(deps: PollerDeps) {
           }),
         );
         console.log(
-          `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
+          `[poller] correlation=${correlationId} skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason
               ? ` (${boundedLabel(event.payload.reason, 160)})`
@@ -1557,7 +1560,7 @@ export function createPoller(deps: PollerDeps) {
           }),
         );
         console.warn(
-          `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
+          `[poller] correlation=${correlationId} cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
             `dropping ${event.payload.name} at ledger ${event.ledger}`,
         );
         continue;
@@ -1580,7 +1583,7 @@ export function createPoller(deps: PollerDeps) {
           detail: `${event.payload.name} at ledger ${event.ledger}`,
         });
         console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
+          `[poller] correlation=${correlationId} send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errorMessage(err),
     );
     consecutiveSendFailures += 1;
@@ -1694,6 +1697,8 @@ export function createPoller(deps: PollerDeps) {
     let explicitBackoff: number | null = null;
     beginCycleTracking();
     status.cycles += 1;
+    const correlationId = randomUUID();
+    status.lastCorrelationId = correlationId;
     status.lastPollAt = Date.now();
     metrics?.pollCycles.inc();
     status.lastPollAt = now();

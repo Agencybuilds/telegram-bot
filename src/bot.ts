@@ -172,6 +172,24 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   return lines.join("\n");
 }
 
+export function lastEventMessage(config: BotConfig, status: PollerStatus): string {
+  const lines = [`*Last observed events* — Stellar ${networkLabel(config)}`, ""];
+
+  for (const target of status.targets) {
+    lines.push(`*mimir\-${target.source}*`);
+    if (target.lastEvent === null) {
+      lines.push("No event has been observed since this process started\.", "");
+      continue;
+    }
+    lines.push(formatLastEvent(config, target.lastEvent), "");
+  }
+
+  if (status.targets.length === 0) {
+    lines.push("No contract scan has completed yet\.");
+  }
+  return lines.join("\n").trimEnd();
+}
+
 /**
  * The `/contracts` message: which two contracts this bot watches, and where to
  * look each one up independently — deliberately static (config only, no

@@ -984,6 +984,12 @@ Configuration (see `.env.example`):
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
+Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
+logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
+send, or cycle error can be tied to one bounded cycle. It is not included in
+Telegram messages, persisted cursor data, or carried across a restart; the
+chain remains the source of truth.
+
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the
 version-1 cursor format or Telegram delivery, and the previous build safely

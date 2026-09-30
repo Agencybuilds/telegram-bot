@@ -52,6 +52,11 @@ Check:
 * any target resuming from a floor rewind (`rewindFromLedger`)
 * last error and consecutive failure count
 
+The correlation ID identifies the most recently started poll cycle. Use it to
+group the bounded scan, malformed-event, rate-limit, send, and cycle-error log
+lines for that cycle. A new process creates new IDs; they are intentionally not
+stored in the version-1 cursor file or sent to Telegram.
+
 For a read-only chain diagnostic without a Telegram token:
 
 ```bash
@@ -422,6 +427,7 @@ After deployment:
   intended — for a deployment with a `.env`, `envFile.present: true` and the
   bot token's source reported as `env-file`, not `profile-default`.
 * Confirm the expected contract IDs and cursor are shown.
+* Record the latest correlation ID when investigating a specific poll cycle.
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.
 
