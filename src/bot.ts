@@ -42,6 +42,9 @@ import {
   PAUSE_MESSAGES,
   RESUME_MESSAGES,
 } from "./i18n.js";
+import { CommandRateLimiter } from "./commands/rate-limit.js";
+import { LogSampler, formatSuppressedRepeats } from "./log-sampler.js";
+export { CommandRateLimiter } from "./commands/rate-limit.js";
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 const COMMANDS = [
@@ -538,6 +541,13 @@ export interface BotDeps {
   botInfo?: UserFromGetMe;
   /** Bounded redacted log ring backing /export. Absent = command disabled. */
   logs?: LogCapture | undefined;
+  /** Per-chat command rate limiter. When absent, a default limiter is created. */
+  rateLimiter?: CommandRateLimiter | undefined;
+  /** Log sampler for rate-limit warnings. When absent, a default sampler is created. */
+  rateLimitSampler?: LogSampler | undefined;
+  /** Injected clock for rate limiting and sampling. */
+  now?: (() => number) | undefined;
+  clock?: (() => number) | undefined;
 }
 
 /**
@@ -589,6 +599,18 @@ export function registerCommandHandlers(
   const { config, status } = deps;
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");
+
+  const clock = deps.now ?? deps.clock;
+  const rateLimiter =
+    deps.rateLimiter ??
+    new CommandRateLimiter(clock ? { now: clock } : {});
+  const sampler =
+    deps.rateLimitSampler ??
+    new LogSampler({
+      maxPerWindow: 1,
+      windowMs: 60_000,
+      now: clock ?? rateLimiter.now,
+    });
 
   /**
    * Gate for commands that expose deployment details. Requests from
@@ -697,7 +719,25 @@ export function registerCommandHandlers(
   };
 
   for (const { command } of COMMANDS) {
-    bot.command(command, handlers[command]);
+    const rawHandler = handlers[command];
+    bot.command(command, async (ctx) => {
+      if (!isOperator(ctx, config)) {
+        const chatId = ctx.chat?.id ?? ctx.from?.id;
+        if (chatId !== undefined) {
+          if (!rateLimiter.consume(chatId)) {
+            const sample = sampler.record(String(chatId));
+            if (sample.log) {
+              const repeats = formatSuppressedRepeats(sample.suppressed, sampler.windowMs);
+              console.warn(
+                `[bot] rate limit exceeded for chat ${chatId}, ignoring /${command}${repeats}`,
+              );
+            }
+            return;
+          }
+        }
+      }
+      await rawHandler(ctx);
+    });
   }
 }
 
