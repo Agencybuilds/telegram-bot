@@ -999,6 +999,10 @@ export async function handleCallbackQuery(
 }
 
 export function createBot(deps: BotDeps): Bot {
+  const clientOptions =
+    deps.config.telegramApiRoot !== undefined && deps.config.telegramApiRoot !== null
+      ? { client: { apiRoot: deps.config.telegramApiRoot } }
+      : undefined;
   const tokenCheck = validateBotTokenShape(deps.config.botToken);
   if (!tokenCheck.ok) {
     // Never include the token (or any part of it) in the thrown error.
@@ -1008,7 +1012,9 @@ export function createBot(deps: BotDeps): Bot {
   }
   const bot = new Bot(
     deps.config.botToken,
-    deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
+    deps.botInfo !== undefined
+      ? { botInfo: deps.botInfo, ...clientOptions }
+      : clientOptions,
   );
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
@@ -1235,6 +1241,3 @@ export async function registerCommands(bot: Bot, config?: BotConfig): Promise<vo
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
-
-
-
