@@ -65,6 +65,7 @@ import {
 } from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
 import type { SendExtra } from "./bot.js";
+import { createCategoryCounter } from "./commands/categories.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow } from "./dedup.js";
@@ -353,6 +354,8 @@ export interface PollerStatus {
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
   targets: TargetState[];
+  /** Bounded category counts derived from observed claim_created events. */
+  categories?: Record<string, number>;
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
   /** RPC circuit breaker state */
@@ -1472,6 +1475,8 @@ export function createPoller(deps: PollerDeps) {
     status.deadLetter = deadLetter.stats();
   }
 
+  const categoryCounter = createCategoryCounter({ config });
+
   const sinceStartCounters: PollerCounters = {
     cycles: 0,
     notificationsSent: 0,
@@ -2004,6 +2009,7 @@ export function createPoller(deps: PollerDeps) {
 
     for (const event of events) {
       metrics?.eventsDecoded.inc();
+      categoryCounter.record(event);
 
       if (isAdminPayload(event.payload)) {
         recordSkippedIncrement();
@@ -3172,6 +3178,7 @@ export function createPoller(deps: PollerDeps) {
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
         targets: [...state.values()].map((t) => ({ ...t })),
+        categories: categoryCounter.countsRecord(),
       };
     },
 
