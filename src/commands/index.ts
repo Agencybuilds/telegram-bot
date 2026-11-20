@@ -27,6 +27,7 @@ import "./categories.js";
 import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
+import "./match-preview.js"; // hidden: operator subscription match count
 
 export {
   commandMetadata,
@@ -72,3 +73,9 @@ export {
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";
+export {
+  matchPreviewCommand,
+  matchPreviewMessage,
+  matchPreviewInvalidMessage,
+  MATCH_PREVIEW_USAGE,
+} from "./match-preview.js";
