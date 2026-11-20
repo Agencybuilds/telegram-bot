@@ -64,6 +64,11 @@ import {
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
+import {
+  NotificationAge,
+  type NotificationAgeSummary,
+  type NotificationIngestionMark,
+} from "./stellar/metrics.js";
 import type { SendExtra } from "./bot.js";
 import { createCategoryCounter } from "./commands/categories.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
@@ -294,6 +299,8 @@ export interface PollerStatus {
   oldestLedger: number | null;
   notificationsSent: number;
   notificationsFailed: number;
+  /** End-to-end notification age (ledger close -> confirmed send) summary. */
+  notificationAge?: NotificationAgeSummary;
   /** Never attempted (unknown, malformed or over the per-cycle cap). */
   eventsSkipped: number;
   /** Counter values accumulated since this process started. */
@@ -541,6 +548,11 @@ export interface PollerDeps {
   activityBaselineOptions?: ActivityBaselineOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Monotonic clock (ms) used to measure in-process duration from event ingestion
+   * to confirmed send. Defaults to `() => performance.now()`.
+   */
+  monotonicNow?: () => number;
   /**
    * Async delay used for send-spacing and retry back-off.
    * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
@@ -1346,6 +1358,9 @@ export function createPoller(deps: PollerDeps) {
       DEFAULT_SEND_TIMEOUT_MS,
   };
   const now = deps.now ?? Date.now;
+  const hasCustomWallClock = deps.now !== undefined;
+  const hasCustomMonotonicClock = deps.monotonicNow !== undefined;
+  const notificationAge = new NotificationAge(deps.monotonicNow ?? (() => performance.now()));
   const sleep = deps.sleep ?? defaultSleep;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
@@ -1498,6 +1513,7 @@ export function createPoller(deps: PollerDeps) {
     oldestLedger: null,
     notificationsSent: 0,
     notificationsFailed: 0,
+    notificationAge: notificationAge.summary(),
     eventsSkipped: 0,
     sinceStart: { ...sinceStartCounters },
     cumulative: {
@@ -2000,6 +2016,7 @@ export function createPoller(deps: PollerDeps) {
   async function notify(
     events: DecodedEvent[],
     correlationId: string,
+    ingested: NotificationIngestionMark = notificationAge.markIngested(now()),
   ): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
@@ -2211,6 +2228,12 @@ export function createPoller(deps: PollerDeps) {
         );
         recordSentIncrement();
         metrics?.notificationsSent.inc();
+        const ageMs =
+          hasCustomWallClock && !hasCustomMonotonicClock
+            ? notificationAge.record(event.at, Math.max(ingested.wallMs, now()))
+            : notificationAge.recordFromIngestion(event.at, ingested);
+        metrics?.recordNotificationAge(ageMs);
+        status.notificationAge = notificationAge.summary();
         sentThisCycle += 1;
         if (sendJournal) {
           try {
@@ -2685,8 +2708,9 @@ export function createPoller(deps: PollerDeps) {
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
+            const ingested = notificationAge.markIngested(now());
             markDirty();
-            delivery = await notify(scan.events, correlationId);
+            delivery = await notify(scan.events, correlationId, ingested);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
             console.log(
               `[poller] ${target.source}: ${scan.events.length} event(s) ` +
