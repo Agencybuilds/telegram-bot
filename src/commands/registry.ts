@@ -47,11 +47,12 @@ export interface CommandDeps {
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
   /**
-   * Follow store for subscription data. When provided, the operator can use
-   * `/matchpreview` to count how many chats follow a given event reference.
-   * Absent means that command reports zero matches.
+   * Persisted per-chat market follows backing /follow, /unfollow, /following.
+   * When provided, the operator can also use `/matchpreview` to count how many
+   * chats follow a given event reference. Absent means that command reports
+   * zero matches.
    */
-  followStore?: FollowStore | undefined;
+  follows?: FollowStore | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */
