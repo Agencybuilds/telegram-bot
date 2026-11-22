@@ -48,6 +48,11 @@ Routing previews report which Telegram destinations an event would be delivered 
 
 Previews are read-only: they perform no Telegram API calls, do not advance the cursor, and do not write to `CURSOR_FILE`. A preview does not guarantee delivery; the live path remains the authority for what is actually sent.
 
+### Resolution Latency Analysis
+- **Conflicting terminal events**: The resolution-latency reducer (`src/stellar/resolution-latency.ts`) tracks terminal events per identity. If two or more terminal events for the same identity disagree on their resolution (for example, one reports `resolved` and another reports `cancelled`), the reducer does **not** silently keep the last event. It returns an explicit inconsistency result naming the identity and the conflicting resolutions, and no latency summary is produced for that identity.
+- Identical repeated terminal events for the same identity are treated as duplicates and do not constitute a conflict.
+- This is a read-only analytical behavior. It does not alter notification dispatch, the cursor, or any on-chain state.
+
 ### Health Reporting
 - `HEALTH_HOST` & `HEALTH_PORT`: Binds a local HTTP endpoint for health probes (e.g., Kubernetes liveness probes). Set port to 0 to disable.
 - `HEALTH_STALE_MS`: Marks the health endpoint as degraded if no successful poll completes within this window (e.g., 90000ms).
