@@ -9,16 +9,20 @@
  *
  * Two families of callbacks share this module:
  *  - navigation/operator actions (`status`, `contracts`, `help`, `pause`,
- *    `resume`, `broadcast`), handled by {@link handleCallbackQuery}. Broadcast
- *    confirmations are bound to a fingerprint of the reviewed destination set
- *    and cancel if route configuration changes before confirmation.
+ *    `resume`, `broadcast`, `confirmations`), handled by {@link handleCallbackQuery}.
+ *    Broadcast confirmations are bound to a fingerprint of the reviewed destination
+ *    set and cancel if route configuration changes before confirmation.
  *  - the `/pause` confirmation buttons, which carry their own payloads and a
  *    TTL, handled by {@link handlePauseConfirmCallback}
  */
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import { safeErrorMessage } from "./notifications/format.js";
+import {
+  handleBroadcastCallback,
+  handleConfirmationsCallback,
+} from "./commands/broadcast.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -53,7 +57,14 @@ export {
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
+export type CallbackActionType =
+  | "status"
+  | "contracts"
+  | "help"
+  | "pause"
+  | "resume"
+  | "broadcast"
+  | "confirmations";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
@@ -77,7 +88,15 @@ export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
 function isKnownAction(val: string): val is CallbackActionType {
-  return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
+  return [
+    "status",
+    "contracts",
+    "help",
+    "pause",
+    "resume",
+    "broadcast",
+    "confirmations",
+  ].includes(val);
 }
 
 /** Maximum digits for JavaScript Number.MAX_SAFE_INTEGER (9,007,199,254,740,991 has 16 digits). */
@@ -463,7 +482,12 @@ export async function handleCallbackQuery(
   const { action } = validation;
 
   // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
+  if (
+    action.type === "pause" ||
+    action.type === "resume" ||
+    action.type === "broadcast" ||
+    action.type === "confirmations"
+  ) {
     if (!isOperator(ctx, config)) {
       const ids = extractCallbackLogIds(ctx, [config.botToken]);
       console.warn(
@@ -482,6 +506,11 @@ export async function handleCallbackQuery(
     switch (action.type) {
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
+        break;
+      }
+
+      case "confirmations": {
+        await handleConfirmationsCallback(ctx, deps, action.raw);
         break;
       }
 
