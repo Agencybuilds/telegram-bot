@@ -10,13 +10,19 @@
 
 import crypto from "node:crypto";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 
 import {
   emptyActivityBaseline,
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
-import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import {
+  configProvenance,
+  DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
+  networkLabel,
+  type BotConfig,
+  type ConfigProvenance,
+} from "./config.js";
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
@@ -36,6 +42,15 @@ export interface HealthDeps {
    * {@link configProvenance}; either way only key names and origins are served.
    */
   provenance?: () => ConfigProvenance;
+}
+
+export interface HealthCloseOptions {
+  /**
+   * Milliseconds to wait for active or stalled client sockets to close during
+   * shutdown before force-closing them. Defaults to `config.healthShutdownGraceMs`
+   * (or {@link DEFAULT_HEALTH_SHUTDOWN_GRACE_MS}); `0` force-closes immediately.
+   */
+  gracePeriodMs?: number;
 }
 
 export interface HealthServer {
@@ -646,12 +661,14 @@ function sendJson(
   res: http.ServerResponse,
   statusCode: number,
   body: unknown,
+  closing = false,
 ): void {
   const payload = `${JSON.stringify(body)}\n`;
   res.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(payload),
+    ...(closing ? { connection: "close" } : {}),
   });
   res.end(payload);
 }
@@ -681,8 +698,19 @@ function sendUnauthorized(res: http.ServerResponse): void {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "content-length": "0",
+    ...(closing ? { connection: "close" } : {}),
   });
   res.end();
+}
+
+function resolveShutdownGraceMs(overrideMs: number | undefined, configMs: number | undefined): number {
+  if (typeof overrideMs === "number" && Number.isFinite(overrideMs)) {
+    return Math.max(0, Math.trunc(overrideMs));
+  }
+  if (typeof configMs === "number" && Number.isFinite(configMs)) {
+    return Math.max(0, Math.trunc(configMs));
+  }
+  return DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
 }
 
 /**
@@ -713,7 +741,15 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     };
   }
 
+  const sockets = new Set<Socket>();
+  let closing = false;
+  let closePromise: Promise<void> | null = null;
+
   const server = http.createServer((req, res) => {
+    if (closing) {
+      res.setHeader("Connection", "close");
+    }
+
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
@@ -730,7 +766,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
 
     // Check authentication for all routes when token is configured
     if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
-      sendUnauthorized(res);
+      sendUnauthorized(res, closing);
       return;
     }
 
@@ -748,13 +784,18 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     if (method === "GET" && (url.pathname === "/health/live" || url.pathname === "/livez")) {
       // Liveness: the process is up and the HTTP server can answer. Do not
       // reflect poller degradation here — supervisors use /health for that.
-      sendJson(res, 200, {
-        ok: true,
-        status: "live",
-        service: "mimir-telegram-bot",
-        version: config.version,
-        checkedAt: new Date(now()).toISOString(),
-      });
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          status: "live",
+          service: "mimir-telegram-bot",
+          version: config.version,
+          checkedAt: new Date(now()).toISOString(),
+        },
+        closing,
+      );
       return;
     }
 
@@ -764,22 +805,35 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         "content-type": "text/plain; version=0.0.4; charset=utf-8",
         "cache-control": "no-store",
         "content-length": Buffer.byteLength(metrics),
+        ...(closing ? { connection: "close" } : {}),
       });
       res.end(metrics);
       return;
     }
 
     if (method === "GET" && url.pathname === "/") {
-      sendJson(res, 200, {
-        service: "mimir-telegram-bot",
-        health: "/health",
-        live: "/health/live",
-        metrics: "/metrics",
-      });
+      sendJson(
+        res,
+        200,
+        {
+          service: "mimir-telegram-bot",
+          health: "/health",
+          live: "/health/live",
+          metrics: "/metrics",
+        },
+        closing,
+      );
       return;
     }
 
-    sendJson(res, 404, { ok: false, error: "not_found" });
+    sendJson(res, 404, { ok: false, error: "not_found" }, closing);
+  });
+
+  server.on("connection", (socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => {
+      sockets.delete(socket);
+    });
   });
 
   // Failures after listen (e.g. client aborts) must not take down the notifier.
@@ -796,6 +850,13 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     `[health] listening on ${url} (GET /health, GET /health/live` +
       `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
   );
+
+  const forceDestroySockets = (): void => {
+    server.closeAllConnections?.();
+    for (const socket of sockets) {
+      if (!socket.destroyed) socket.destroy();
+    }
+  };
 
   return {
     url,
