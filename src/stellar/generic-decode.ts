@@ -17,6 +17,7 @@
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import type { DecoderCapabilityReport } from "./decode.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
