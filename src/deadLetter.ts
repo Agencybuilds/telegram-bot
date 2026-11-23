@@ -72,6 +72,24 @@ export interface DeadLetterAckResult {
   remaining: number;
 }
 
+/**
+ * Bounded, content-free utilization report for the queue. Carries only counts
+ * and capacity — never message bodies, error text, or identifiers — so it is
+ * safe to expose on a gauge or a status endpoint.
+ *
+ * When the queue is disabled (`maxEntries` below 1) `enabled` is `false`,
+ * `maxEntries` is `0`, and `utilization` is `0`: a disabled queue has no
+ * capacity to be utilized, and reporting `0` keeps the gauge bounded in
+ * `[0, 1]` rather than dividing by zero or emitting `NaN`.
+ */
+export interface DeadLetterCapacity {
+  enabled: boolean;
+  used: number;
+  maxEntries: number;
+  /** `used / maxEntries`, clamped to `[0, 1]`; `0` when disabled. */
+  utilization: number;
+}
+
 export interface DeadLetterQueueOptions {
   /**
    * Where the queue lives. `null` disables persistence and loading: the queue
@@ -533,182 +551,26 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   }
 
   /**
-   * Interruptible, resumable recovery over a filtered selection of entries.
-   * Persists a bounded checkpoint of acknowledged IDs so a resumed run skips
-   * entries that were already acknowledged before interruption.
+   * Content-free capacity snapshot. A queue is considered disabled when it has
+   * no capacity (`maxEntries` below 1) — the same condition under which
+   * `enqueue` would otherwise evict on every insert. Disabled reports
+   * `enabled: false`, `maxEntries: 0`, `utilization: 0`.
    */
-  async function recoverSelection(
-    send: (text: string, entry: DeadLetterEntry) => Promise<void>,
-    recoverOptions: RecoverSelectionOptions = {},
-  ): Promise<RecoverSelectionResult> {
-    const maxAckIds = recoverOptions.maxAcknowledgedIds ?? DEAD_LETTER_CHECKPOINT_MAX_IDS;
-    const checkpointFile = recoverOptions.checkpointFile;
-
-    if (checkpointFile && recoverOptions.resetCheckpoint) {
-      await clearRecoveryCheckpoint(checkpointFile);
+  function capacity(): DeadLetterCapacity {
+    const enabled = options.maxEntries >= 1;
+    if (!enabled) {
+      return { enabled: false, used: 0, maxEntries: 0, utilization: 0 };
     }
-
-    const existingCheckpoint = checkpointFile
-      ? await loadRecoveryCheckpoint(checkpointFile, maxAckIds)
-      : null;
-    const acknowledgedIds = existingCheckpoint ? [...existingCheckpoint.acknowledgedIds] : [];
-    const acknowledgedSet = new Set(acknowledgedIds);
-
-    const budget = recoverOptions.budget ?? entries.length;
-    let sent = 0;
-    let skippedAcknowledged = 0;
-    let interrupted = false;
-    const kept: DeadLetterEntry[] = [];
-
-    for (let index = 0; index < entries.length; index += 1) {
-      const entry = entries[index]!;
-      if (acknowledgedSet.has(entry.id)) {
-        skippedAcknowledged += 1;
-        continue;
-      }
-      if (recoverOptions.source && entry.source !== recoverOptions.source) {
-        kept.push(entry);
-        continue;
-      }
-      if (recoverOptions.signal?.aborted || sent >= budget) {
-        interrupted = true;
-        kept.push(...entries.slice(index));
-        break;
-      }
-
-      try {
-        await send(entry.text, entry);
-        sent += 1;
-        stats.replayed += 1;
-        if (!acknowledgedSet.has(entry.id)) {
-          acknowledgedSet.add(entry.id);
-          acknowledgedIds.push(entry.id);
-        }
-        if (checkpointFile) {
-          await saveRecoveryCheckpoint(
-            checkpointFile,
-            {
-              version: 1,
-              updatedAt: new Date(now()).toISOString(),
-              acknowledgedIds,
-              source: recoverOptions.source,
-              completed: false,
-            },
-            maxAckIds,
-          );
-        }
-      } catch (err) {
-        entry.attempts += 1;
-        entry.lastError = safeError(err);
-        if (entry.attempts >= options.maxAttempts) {
-          stats.dropped += 1;
-        } else {
-          kept.push(entry);
-        }
-      }
-    }
-
-    entries = kept;
-    syncDepth();
-    await persist();
-
-    const remainingSelected = entries.filter(
-      (e) =>
-        !acknowledgedSet.has(e.id) &&
-        (!recoverOptions.source || e.source === recoverOptions.source),
-    ).length;
-    const completed = !interrupted && remainingSelected === 0;
-
-    if (checkpointFile) {
-      await saveRecoveryCheckpoint(
-        checkpointFile,
-        {
-          version: 1,
-          updatedAt: new Date(now()).toISOString(),
-          acknowledgedIds,
-          source: recoverOptions.source,
-          completed,
-        },
-        maxAckIds,
-      );
-    }
-
-    return {
-      sent,
-      skippedAcknowledged,
-      remaining: entries.length,
-      interrupted,
-      completed,
-      acknowledgedCount: boundAcknowledgedIds(acknowledgedIds, maxAckIds).length,
-    };
-  }
-
-  /**
-   * Atomically acknowledge (remove) an explicit, bounded list of inspected
-   * dead-letter entry IDs. Unmatched IDs are reported and all non-matching
-   * queued entries are preserved untouched in their original order.
-   */
-  async function acknowledge(ids: readonly string[]): Promise<DeadLetterAckResult> {
-    if (!Array.isArray(ids) || ids.length === 0) {
-      throw new RangeError("acknowledge requires at least one entry id");
-    }
-    if (ids.length > DEAD_LETTER_MAX_ACK_IDS) {
-      throw new RangeError(
-        `acknowledge accepts at most ${DEAD_LETTER_MAX_ACK_IDS} entry ids (received ${ids.length})`,
-      );
-    }
-
-    const normalizedIds: string[] = [];
-    const requestedSet = new Set<string>();
-    for (const rawId of ids) {
-      if (typeof rawId !== "string" || rawId.trim() === "") {
-        throw new RangeError("acknowledge entry ids must be non-empty strings");
-      }
-      const id = rawId.trim();
-      if (!requestedSet.has(id)) {
-        requestedSet.add(id);
-        normalizedIds.push(id);
-      }
-    }
-
-    const acknowledged: DeadLetterEntry[] = [];
-    const kept: DeadLetterEntry[] = [];
-    const matchedSet = new Set<string>();
-
-    for (const entry of entries) {
-      if (requestedSet.has(entry.id)) {
-        acknowledged.push(entry);
-        matchedSet.add(entry.id);
-      } else {
-        kept.push(entry);
-      }
-    }
-
-    const unmatchedIds = normalizedIds.filter((id) => !matchedSet.has(id));
-
-    if (acknowledged.length > 0) {
-      entries = kept;
-      syncDepth();
-      await persist();
-      console.log(
-        `[dead-letter] acknowledged ${acknowledged.length} entry(s) ` +
-          `(${unmatchedIds.length} unmatched, ${entries.length} remaining)`,
-      );
-    }
-
-    return {
-      acknowledged: acknowledged.map((e) => ({ ...e })),
-      acknowledgedIds: acknowledged.map((e) => e.id),
-      unmatchedIds,
-      remaining: entries.length,
-    };
+    const used = entries.length;
+    const utilization = Math.min(1, Math.max(0, used / options.maxEntries));
+    return { enabled: true, used, maxEntries: options.maxEntries, utilization };
   }
 
   return {
     load,
     enqueue,
     flush,
-    acknowledge,
+    capacity,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

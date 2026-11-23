@@ -321,9 +321,20 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
-  /** Fixed-bucket queue age histogram (in seconds) for pending deliveries,
-   *  partitioned by stable destination class (never chat IDs or event IDs). */
-  pendingDeliveryQueueAge: QueueAgeHistogram;
+  /** Total confirmed notifications with a known ledger close time (includes 0ms lag). */
+  notificationAgeSamples: Counter;
+  /** Total confirmed notifications whose event lacked a valid ledger close time. */
+  notificationAgeMissingLedgerTime: Counter;
+  /** Cumulative end-to-end notification age in milliseconds across known-ledger-time samples. */
+  notificationAgeTotalMs: Counter;
+  /** End-to-end age in ms of the most recent confirmed notification with a known ledger time. */
+  lastNotificationAgeMs: Gauge;
+  /** Maximum observed end-to-end notification age in ms across confirmed sends. */
+  maxNotificationAgeMs: Gauge;
+  /** Entries currently held in the dead-letter queue (0 when the queue is disabled). */
+  deadLetterEntries: Gauge;
+  /** Maximum entries the dead-letter queue can hold (0 when the queue is disabled). */
+  deadLetterCapacity: Gauge;
 
   /** Register a custom counter with validated Prometheus label keys. */
   registerLabeledCounter(
@@ -427,11 +438,125 @@ interface RegisteredMetric {
   metric: Counter | Gauge;
 }
 
-const METRICS_PREFIX = "mimir_bot_";
+export function createMetrics(options?: MetricsOptions): MetricsRegistry {
+  const serviceLevel = new ServiceLevelWindow({
+    windowSize: options?.serviceLevelWindowSize,
+  });
+  const pollCycles = makeCounter(
+    `${METRICS_PREFIX}poll_cycles_total`,
+    "Total number of poll cycles started.",
+  );
+  const rpcRequests = makeCounter(
+    `${METRICS_PREFIX}rpc_requests_total`,
+    "Total successful Soroban RPC getEvents calls.",
+  );
+  const rpcErrors = makeCounter(
+    `${METRICS_PREFIX}rpc_errors_total`,
+    "Total failed Soroban RPC getEvents calls.",
+  );
+  const eventsDecoded = makeCounter(
+    `${METRICS_PREFIX}events_decoded_total`,
+    "Total on-chain events returned by the RPC and passed through the decoder.",
+  );
+  const eventsSkipped = makeCounter(
+    `${METRICS_PREFIX}events_skipped_total`,
+    "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
+  );
+  const eventsFiltered = makeCounter(
+    `${METRICS_PREFIX}events_filtered_total`,
+    "Total events intentionally filtered out (excluded from failure-rate denominator).",
+  );
+  const eventsFilteredFeatureFlag = makeCounter(
+    `${METRICS_PREFIX}events_filtered_feature_flag_total`,
+    "Total events intentionally filtered out by NOTIFY_* feature flags.",
+  );
+  const eventsFilteredRule = makeCounter(
+    `${METRICS_PREFIX}events_filtered_rule_total`,
+    "Total events intentionally filtered out by category or filter rules.",
+  );
+  const notificationsSent = makeCounter(
+    `${METRICS_PREFIX}notifications_sent_total`,
+    "Total Telegram messages successfully sent.",
+  );
+  const notificationsFailed = makeCounter(
+    `${METRICS_PREFIX}notifications_failed_total`,
+    "Total Telegram sends that threw an error (cursor still advanced).",
+  );
+  const staleCursorEvents = makeCounter(
+    `${METRICS_PREFIX}stale_cursor_events_total`,
+    "Number of times a stale-cursor warning was emitted (events in the gap are lost).",
+  );
+  const consecutiveFailures = makeGauge(
+    `${METRICS_PREFIX}consecutive_failures`,
+    "Current number of consecutive full-cycle RPC failures (resets to 0 on any success).",
+  );
+  const lastCycleEvents = makeGauge(
+    `${METRICS_PREFIX}last_cycle_events`,
+    "Events observed in the most recent complete poll cycle.",
+  );
+  const activityBaselineEvents = makeGauge(
+    `${METRICS_PREFIX}activity_baseline_events`,
+    "Rolling mean events per cycle at the most recent baseline comparison (rounded).",
+  );
+  const activityAnomalies = makeCounter(
+    `${METRICS_PREFIX}activity_anomalies_total`,
+    "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
+  );
+  const deadLetterEntries = makeGauge(
+    `${METRICS_PREFIX}dead_letter_entries`,
+    "Entries currently held in the dead-letter queue (0 when the queue is disabled).",
+  );
+  const deadLetterCapacity = makeGauge(
+    `${METRICS_PREFIX}dead_letter_capacity`,
+    "Maximum entries the dead-letter queue can hold (0 when the queue is disabled).",
+  );
+  const notificationAgeSamples = makeCounter(
+    `${METRICS_PREFIX}notification_age_samples_total`,
+    "Total confirmed notifications with a known ledger close time (includes 0ms lag).",
+  );
+  const notificationAgeMissingLedgerTime = makeCounter(
+    `${METRICS_PREFIX}notification_age_missing_ledger_time_total`,
+    "Total confirmed notifications whose event lacked a valid ledger close time.",
+  );
+  const notificationAgeTotalMs = makeCounter(
+    `${METRICS_PREFIX}notification_age_ms_total`,
+    "Cumulative end-to-end notification age in milliseconds from ledger close time to confirmed send.",
+  );
+  const lastNotificationAgeMs = makeGauge(
+    `${METRICS_PREFIX}last_notification_age_ms`,
+    "End-to-end age in milliseconds of the most recent confirmed notification with a known ledger close time.",
+  );
+  const maxNotificationAgeMs = makeGauge(
+    `${METRICS_PREFIX}max_notification_age_ms`,
+    "Maximum observed end-to-end notification age in milliseconds from ledger close time to confirmed send.",
+  );
 
-export function createMetrics(): MetricsRegistry {
-  /** Insertion-ordered registry of every metric this instance has created. */
-  const registry = new Map<string, RegisteredMetric>();
+  const counters = [
+    pollCycles,
+    rpcRequests,
+    rpcErrors,
+    eventsDecoded,
+    eventsSkipped,
+    eventsFiltered,
+    eventsFilteredFeatureFlag,
+    eventsFilteredRule,
+    notificationsSent,
+    notificationsFailed,
+    staleCursorEvents,
+    activityAnomalies,
+    notificationAgeSamples,
+    notificationAgeMissingLedgerTime,
+    notificationAgeTotalMs,
+  ];
+  const gauges = [
+    consecutiveFailures,
+    lastCycleEvents,
+    activityBaselineEvents,
+    lastNotificationAgeMs,
+    maxNotificationAgeMs,
+    deadLetterEntries,
+    deadLetterCapacity,
+  ];
 
   /**
    * Create a metric on first sight, or return the existing one on an identical
@@ -785,7 +910,29 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
-    pendingDeliveryQueueAge,
+    notificationAgeSamples,
+    notificationAgeMissingLedgerTime,
+    notificationAgeTotalMs,
+    lastNotificationAgeMs,
+    maxNotificationAgeMs,
+    deadLetterEntries,
+    deadLetterCapacity,
+    recordNotificationAge,
+    serviceLevel,
+    serviceLevelReport(): ServiceLevelWindowReport {
+      return serviceLevel.report();
+    },
+    recordDelivery(
+      success: boolean,
+      ageMs?: number | null,
+      dataGap?: boolean,
+      gapReason?: ServiceLevelIncompleteReason,
+    ): void {
+      serviceLevel.recordDelivery(success, ageMs, dataGap, gapReason);
+    },
+    recordDataGap(reason?: ServiceLevelIncompleteReason): void {
+      serviceLevel.recordDataGap(reason);
+    },
     render,
     startServer,
     register,
