@@ -10,9 +10,8 @@
  *   npm run replay -- --from 4226500 --dry-run           # log only, no send
  *   npm run replay -- --from 4226500 --contract market   # one contract only
  *   npm run replay -- --from 4226500 --json              # machine-readable
- *   npm run replay -- --from 4226500 --jsonl             # streaming JSONL
- *   npm run replay -- --merge-chunks a.jsonl,b.jsonl     # merge chunks to JSONL
- *   npm run replay -- --from 4226500 --send              # send to Telegram
+ *   npm run replay -- --from 4226500 --send --plan-digest <sha256>
+ *                                                        # send only after sign-off
  *   npm run replay -- --from 4226500 --mock              # local mock profile
  *   npm run replay -- --archive scan.json                # offline from scanner archive
  *   npm run replay -- --archive scan.json --from 4226500 --to 4226800
@@ -20,6 +19,8 @@
  * ── Safety ──────────────────────────────────────────────────────────────────
  *
  * - Requires explicit --send to actually post to Telegram (default: dry-run).
+ * - `--send` also requires `--plan-digest` matching the dry-run preview's plan
+ *   digest, which binds the delivery to the reviewed range and destinations.
  * - `--from` below the RPC's retained floor is clamped with a warning.
  * - `--to` above the chain tip is clamped to the tip.
  * - `--to` before `--from` is a usage error (exit 2).
@@ -206,6 +207,103 @@ export interface ReplayReport {
   };
   /** Deterministic completeness certificate across all requested targets. */
   certificate: ReplayCompletenessCertificate;
+}
+
+// ── Signed-off replay plan ───────────────────────────────────────────────────
+
+export interface ReplayPlanDestination {
+  source: ContractSource;
+  contractId: string;
+}
+
+/**
+ * Reviewable replay plan: the normalized range and every contract destination
+ * the run will walk, bound together by a deterministic SHA-256 digest.
+ */
+export interface ReplayPlan {
+  format: "mimir-replay-plan-v1";
+  network: string;
+  /** Normalized `--from`: a ledger number or an opaque cursor token. */
+  from: string;
+  /** Inclusive upper bound, or null when the plan replays to the chain tip. */
+  to: number | null;
+  /** Selected contract sources, sorted for determinism. */
+  contracts: ContractSource[];
+  /** Contract destinations, sorted by source then contract id. */
+  destinations: ReplayPlanDestination[];
+  /** Lowercase hex SHA-256 of the canonical plan fields. */
+  digest: string;
+}
+
+export interface ReplayPlanInput {
+  network: string;
+  from: string | number;
+  to?: number | null | undefined;
+  targets: readonly Pick<WatchTarget, "source" | "contractId">[];
+}
+
+function compareCodePoints(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+/**
+ * Compute the SHA-256 plan digest over an explicit canonical form.
+ *
+ * The digest depends only on the plan format, network, normalized range, and
+ * the sorted contract destinations — never on flag order, object key order, or
+ * which of the two contracts was selected first. It deliberately excludes
+ * chain-tip/clamped values so a preview digest stays valid as the chain moves.
+ */
+export function computeReplayPlanDigest(
+  plan: Omit<ReplayPlan, "digest">,
+): string {
+  const destinations = plan.destinations
+    .map((destination) => [destination.source, destination.contractId])
+    .sort((a, b) =>
+      compareCodePoints(a[0] ?? "", b[0] ?? "") ||
+      compareCodePoints(a[1] ?? "", b[1] ?? ""),
+    );
+  const canonical = JSON.stringify([
+    plan.format,
+    plan.network,
+    plan.from,
+    plan.to,
+    [...plan.contracts].sort(compareCodePoints),
+    destinations,
+  ]);
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/** Build a replay plan and its deterministic digest from the run's inputs. */
+export function buildReplayPlan(input: ReplayPlanInput): ReplayPlan {
+  const destinations: ReplayPlanDestination[] = input.targets
+    .map((target) => ({ source: target.source, contractId: target.contractId }))
+    .sort(
+      (a, b) =>
+        compareCodePoints(a.source, b.source) ||
+        compareCodePoints(a.contractId, b.contractId),
+    );
+  const contracts = [...new Set(destinations.map((destination) => destination.source))].sort(
+    compareCodePoints,
+  );
+
+  const base = {
+    format: "mimir-replay-plan-v1" as const,
+    network: input.network,
+    from: normalizeRangeFrom(input.from),
+    to: normalizeRangeTo(input.to),
+    contracts,
+    destinations,
+  };
+
+  return { ...base, digest: computeReplayPlanDigest(base) };
+}
+
+/** True when `value` is a lowercase hex SHA-256 plan digest. */
+export function isValidReplayPlanDigest(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
 }
 
 // ── Progress / Checkpoint schema ─────────────────────────────────────────────
@@ -2400,109 +2498,37 @@ export async function runReplayCli(opts: {
     ? [contractFilter]
     : ["market", "squad"];
 
-  // ── Offline archive mode (no RPC) ─────────────────────────────────────────
+  // ── Signed-off plan ───────────────────────────────────────────────────────
 
-  if (archivePath) {
-    let archive: ScanJsonReport;
-    try {
-      archive = await loadAndValidateScannerArchive(archivePath, { network });
-    } catch (err: unknown) {
-      console.error(`[replay] error: ${err instanceof Error ? err.message : String(err)}`);
-      return { report: null, exitCode: 2 };
-    }
+  const plan = buildReplayPlan({
+    network,
+    from: fromRaw,
+    to: toLedger ?? null,
+    targets,
+  });
 
-    if (!asJson) {
-      progress(`[replay] network   ${network} · archive ${archivePath} (offline, no RPC)`);
-      progress(
-        `[replay] range     ${fromLedger !== undefined ? `from ${fromLedger}` : `from ${archive.ledgers.oldest}`}` +
-          `${toLedger !== undefined ? `  to ${toLedger}` : `  to ${archive.ledgers.latest}`}`,
-      );
-      progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
-    } else {
-      progress(
-        `replay ${network} archive=${archivePath} from=${fromLedger ?? archive.ledgers.oldest} to=${toLedger ?? archive.ledgers.latest} mode=${dryRun ? "dry-run" : "send"}`,
-      );
-    }
-
-    const targetResults: ReplayTargetResult[] = [];
-    for (const target of targets) {
-      const result = await replayContractFromArchive(
-        archive,
-        target,
-        {
-          fromLedger,
-          toLedger,
-          cap,
-          show,
-          dryRun,
-        },
-        dryRun ? undefined : send,
-        config,
-        progress,
-      );
-      targetResults.push(result);
-    }
-
-    const totals = targetResults.reduce(
-      (acc, r) => ({
-        events: acc.events + r.events,
-        sent: acc.sent + r.sent,
-        skipped: acc.skipped + r.skipped,
-        capped: acc.capped + r.capped,
-        adminLogged: acc.adminLogged + r.adminLogged,
-        duplicates: acc.duplicates + r.duplicates,
-        resumedSkippedEvents: (acc.resumedSkippedEvents ?? 0) + (r.resumedSkippedEvents ?? 0),
-        failedSends: (acc.failedSends ?? 0) + (r.failedSends ?? 0),
-      }),
-      {
-        events: 0,
-        sent: 0,
-        skipped: 0,
-        capped: 0,
-        adminLogged: 0,
-        duplicates: 0,
-        resumedSkippedEvents: 0,
-        failedSends: 0,
-      },
+  if (!dryRun && planDigestRaw !== plan.digest) {
+    console.error(
+      `[replay] error: plan digest mismatch — preview was ${planDigestRaw}, ` +
+        `current plan is ${plan.digest}`,
     );
-
-    const report: ReplayReport = {
-      format: "mimir-replay-v1",
-      network,
-      rpcUrl: archive.rpcUrl,
-      archivePath,
-      fromLedger: fromLedger ?? archive.ledgers.oldest,
-      toLedger: toLedger ?? archive.ledgers.latest,
-      dryRun,
-      targets: targetResults,
-      totals,
-    };
-
-    if (asJson) {
-      process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
-    } else {
-      progress(
-        `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +
-          `capped=${totals.capped} admin=${totals.adminLogged} duplicates=${totals.duplicates}`,
-      );
-    }
-
-    return { report, exitCode: 0 };
+    console.error(
+      "The range or destinations changed. Re-run the dry-run preview and review it before delivering.",
+    );
+    return { report: null, exitCode: 2 };
   }
-
-  // ── Live RPC mode ─────────────────────────────────────────────────────────
-
-  const server = overrideDeps.server ?? createRpcServer(config);
 
   if (!asJson) {
     progress(`[replay] network   ${network} · rpc ${config.rpcUrl}`);
-    progress(`[replay] from      ${fromRaw!}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
+    progress(`[replay] from      ${fromRaw}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
     progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
+    progress(`[replay] plan      ${plan.digest}`);
     if (progressFile) progress(`[replay] progress  ${progressFile}`);
     if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
   } else {
     progress(
-      `replay ${network} from=${fromRaw!} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
+      `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
+        ` plan=${plan.digest}` +
         (progressFile ? ` progress=${progressFile}` : "") +
         (rpm !== undefined ? ` rpm=${rpm}` : ""),
     );

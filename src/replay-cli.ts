@@ -8,7 +8,8 @@
  *
  *   npm run replay -- --from 4226500
  *   npm run replay -- --from 4226500 --to 4226800
- *   npm run replay -- --from 4226500 --send        # actually post to Telegram
+ *   npm run replay -- --from 4226500 --send --plan-digest <sha256>
+ *                                                  # post only after sign-off
  *   npm run replay -- --from 4226500 --json        # machine-readable report
  *   npm run replay -- --from 4226500 --jsonl       # streaming JSONL report
  *   npm run replay -- --merge-chunks a.jsonl,b.jsonl # merge chunks to JSONL
@@ -20,6 +21,9 @@
  *
  * Needs no Telegram credentials in dry-run mode (the default). Pass --send to
  * load a full bot config (BOT_TOKEN + TELEGRAM_CHAT_ID) and deliver events.
+ * Delivery additionally requires --plan-digest matching the digest printed by
+ * a dry-run preview of the same range and destinations, so an operator cannot
+ * deliver a plan that was never reviewed.
  *
  * Replay output and progress paths must refer to different files. If both
  * resolve to the same file, the CLI rejects the configuration with a usage
