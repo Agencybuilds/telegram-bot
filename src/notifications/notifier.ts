@@ -69,17 +69,8 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
-  /**
-   * Optional callback invoked when the send timed out before Telegram
-   * responded. The notification may or may not have been accepted — this is an
-   * **unknown outcome**, distinct from a confirmed rejection (4xx error).
-   * Callers that maintain a send journal should call `journal.recordTimeout(id)`
-   * inside this hook to flag the pending intent as a confirmed-unknown outcome
-   * so recovery tooling can distinguish it from a plain crash-recovery intent.
-   * The error that triggered the timeout is passed for bounded logging; never
-   * re-throw from this callback.
-   */
-  onTimeout?: ((err: unknown) => void) | undefined;
+  /** Optional claim/event category used to resolve forum topic overrides. */
+  category?: string | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -403,7 +394,7 @@ export function createNotifier(
         link_preview_options: notificationOptions.link_preview_options,
         ...threadOption,
         ...silentOption,
-        ...threadOption,
+        ...topicOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
