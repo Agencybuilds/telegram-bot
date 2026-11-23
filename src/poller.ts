@@ -369,6 +369,8 @@ export interface PollerStatus {
   /** Result of the startup persistent-volume probe, when reported. */
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
+  /** Structured diagnostic for the most recent cursor load failure, if any. */
+  cursorLoadError?: CursorLoadError | null;
   targets: TargetState[];
   /** Bounded category counts derived from observed claim_created events. */
   categories?: Record<string, number>;
@@ -943,6 +945,41 @@ function withinDeadline(promise: Promise<void>, timeoutMs: number): Promise<bool
   });
 }
 
+
+export type CursorLoadErrorKind = "permission" | "io" | "corrupt";
+
+export type CursorDiagnosticCode =
+  | "CURSOR_NOT_FOUND"
+  | "CURSOR_PERMISSION_DENIED"
+  | "CURSOR_IO_ERROR"
+  | "CURSOR_CORRUPT_JSON";
+
+export interface CursorLoadError {
+  kind: CursorLoadErrorKind;
+  code: CursorDiagnosticCode;
+  errno?: string | undefined;
+  message: string;
+}
+
+const PERMISSION_ERRNO_CODES = new Set(["EACCES", "EPERM", "EROFS"]);
+
+export function classifyCursorFsError(err: unknown): {
+  kind: "not_found" | "permission" | "io";
+  errnoCode: string | undefined;
+  diagnosticCode: Exclude<CursorDiagnosticCode, "CURSOR_CORRUPT_JSON">;
+} {
+  const errnoCode =
+    err && typeof err === "object" && "code" in err && typeof (err as { code?: unknown }).code === "string"
+      ? (err as { code: string }).code
+      : undefined;
+  if (errnoCode === "ENOENT") {
+    return { kind: "not_found", errnoCode, diagnosticCode: "CURSOR_NOT_FOUND" };
+  }
+  if (errnoCode && PERMISSION_ERRNO_CODES.has(errnoCode)) {
+    return { kind: "permission", errnoCode, diagnosticCode: "CURSOR_PERMISSION_DENIED" };
+  }
+  return { kind: "io", errnoCode, diagnosticCode: "CURSOR_IO_ERROR" };
+}
 
 /** Stable quarantine path next to the live cursor file (never overwrites). */
 export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()): string {
@@ -2116,16 +2153,46 @@ export function createPoller(deps: PollerDeps) {
     let raw: string;
     try {
       raw = await readFile(config.cursorFile, "utf8");
-    } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
-      );
+    } catch (err) {
+      const classified = classifyCursorFsError(err);
+      if (classified.kind === "not_found") {
+        status.cursorLoadError = null;
+        console.log(
+          `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+            `${config.startLookbackLedgers} ledgers behind the tip`,
+        );
+        return;
+      }
+
+      const detail = errorMessage(err);
+      const isPermission = classified.kind === "permission";
+      const action = isPermission ? "cursor_permission_denied" : "cursor_read_failed";
+      const msg = isPermission
+        ? `[poller] [${classified.diagnosticCode}] cursor directory or file permission failure reading ${config.cursorFile}` +
+          `${classified.errnoCode ? ` (${classified.errnoCode})` : ""}: ${detail}; preserving existing file without quarantine`
+        : `[poller] [${classified.diagnosticCode}] operational error reading cursor ${config.cursorFile}` +
+          `${classified.errnoCode ? ` (${classified.errnoCode})` : ""}: ${detail}; preserving existing file without quarantine`;
+
+      status.cursorLoadError = {
+        kind: classified.kind,
+        code: classified.diagnosticCode,
+        ...(classified.errnoCode ? { errno: classified.errnoCode } : {}),
+        message: msg,
+      };
+
+      Logger.error("poller", msg, {
+        action,
+        diagnosticCode: classified.diagnosticCode,
+        ...(classified.errnoCode ? { errno: classified.errnoCode } : {}),
+        cursorFile: config.cursorFile,
+        error: detail,
+      });
       return;
     }
 
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
+      status.cursorLoadError = null;
       const parsed = result.file;
       let fingerprintMigrated = false;
       for (const [source, saved] of Object.entries(parsed.targets)) {
@@ -2226,6 +2293,11 @@ export function createPoller(deps: PollerDeps) {
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
+      status.cursorLoadError = {
+        kind: "corrupt",
+        code: "CURSOR_CORRUPT_JSON",
+        message: `[poller] [CURSOR_CORRUPT_JSON] cursor file ${config.cursorFile} is corrupt: ${reason}`,
+      };
       await quarantineCorruptCursorFile(config.cursorFile, reason);
       recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
         at: new Date(now()).toISOString(),

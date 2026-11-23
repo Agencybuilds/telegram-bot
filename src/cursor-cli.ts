@@ -78,8 +78,9 @@ async function exists(filePath: string): Promise<boolean> {
     await access(filePath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    const classified = classifyCursorFsError(err);
+    if (classified.kind === "not_found") return false;
+    throw toCursorFsDiagnostic(err, filePath, "checking");
   }
 }
 
@@ -131,12 +132,27 @@ function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFil
   try {
     return parseAndMigrateCursorFile(raw);
   } catch {
-    throw new Error("cursor file is malformed or uses an unsupported schema");
+    throw new CursorDiagnosticError(
+      "CURSOR_CORRUPT_JSON",
+      `cursor file at "${filePath}" is malformed JSON or uses an unsupported schema`,
+    );
+  }
+}
+
+async function readCursorText(filePath: string): Promise<string> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (err) {
+    throw toCursorFsDiagnostic(err, filePath, "reading");
   }
 }
 
 async function writeAtomic(filePath: string, contents: string, replace: boolean): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await mkdir(path.dirname(filePath), { recursive: true });
+  } catch (err) {
+    throw toCursorFsDiagnostic(err, path.dirname(filePath), "preparing directory for");
+  }
   const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 
   try {
@@ -150,9 +166,13 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
         if ((err as NodeJS.ErrnoException).code === "EEXIST") {
           throw new Error(`destination already exists at ${filePath}; pass --force to overwrite`);
         }
-        throw err;
+        throw toCursorFsDiagnostic(err, filePath, "writing");
       }
     }
+  } catch (err) {
+    if (err instanceof CursorDiagnosticError) throw err;
+    if (err instanceof Error && err.message.includes("destination already exists")) throw err;
+    throw toCursorFsDiagnostic(err, filePath, "writing");
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
   }
