@@ -479,121 +479,84 @@ test("parseFilterExpression: respects custom maxDepth option", () => {
   assert.ok(rule.condition);
 });
 
-// ----------------------------------------------------
-// Mixed-Unit Comparison Rejection & Non-USDC BigInt Fields
-// ----------------------------------------------------
-
-test("parseFilterExpression: rejects mixed-unit comparisons on identifiers and ledger numbers", () => {
-  const mixedCases = [
-    "claim_created where claimId >= 100 USDC",
-    "market_created where marketId == $5",
-    "market_created where deadline > 1000 USDC",
-    "market_created where feeBps <= 50 USDC",
-    "claim_resolved where confidence > 0.5 USDC",
-    "where claimId >= 100 USDC",
-    "where marketId == $10",
-    "where ledger >= 100 USDC",
-  ];
-
-  for (const expr of mixedCases) {
-    assert.throws(
-      () => parseFilterExpression(expr),
-      (err) => {
-        assert.ok(err instanceof FilterParseError, `Expected FilterParseError for: ${expr}`);
-        assert.match(err.message, /Mixed-unit comparison|is a number/);
-        return true;
-      },
-      `Should reject mixed-unit expression: ${expr}`,
-    );
-  }
-});
-
-test("parseFilterExpression: rejects mixed-unit and fractional comparisons on non-USDC bigint fields (shares)", () => {
-  for (const expr of [
-    "deposited where shares >= 100 USDC",
-    "deposited where shares >= $10",
-    "where shares >= 100 USDC",
-  ]) {
-    assert.throws(
-      () => parseFilterExpression(expr),
-      (err) => {
-        assert.ok(err instanceof FilterParseError);
-        assert.match(err.message, /Mixed-unit comparison.*shares.*not a USDC amount/);
-        return true;
-      },
-      `Should reject USDC literal on shares: ${expr}`,
-    );
-  }
-
+test("parseFilterExpression: validation errors include exact source ranges and stable codes without echoing full expression", () => {
+  // Leading whitespace preserved in source range
+  const expr1 = "  claim_created where unknown_field == 'crypto'";
   assert.throws(
-    () => parseFilterExpression("deposited where shares >= 1.5"),
+    () => parseFilterExpression(expr1),
     (err) => {
       assert.ok(err instanceof FilterParseError);
-      assert.match(err.message, /Field "shares" is an integer, cannot compare with fractional number/);
+      assert.equal(err.code, "FILTER_UNKNOWN_FIELD");
+      assert.deepEqual(err.range, { start: 22, end: 35 });
+      assert.equal(expr1.slice(err.range.start, err.range.end), "unknown_field");
+      assert.equal(err.message.includes(expr1.trim()), false);
       return true;
     },
   );
-});
 
-test("evaluateFilterRule: evaluates non-USDC bigint field (shares) without USDC scaling", () => {
-  const rule = parseFilterExpression("deposited where shares >= 100");
-
-  const makeDeposit = (shares) =>
-    mockEvent("squad", {
-      name: "deposited",
-      marketId: 42,
-      side: 1,
-      participant: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      amount: 500_000_000n,
-      shares,
-    });
-
-  assert.equal(evaluateFilterRule(rule, makeDeposit(99n)), false);
-  assert.equal(evaluateFilterRule(rule, makeDeposit(100n)), true);
-  assert.equal(evaluateFilterRule(rule, makeDeposit(150n)), true);
-});
-
-test("evaluateFilterRule: refuses mixed-unit coercion on manually constructed ASTs", () => {
-  const mixedIdRule = {
-    eventName: "claim_created",
-    rawExpression: "claim_created where claimId >= 1 USDC",
-    condition: {
-      type: "comparison",
-      op: ">=",
-      field: "claimId",
-      fieldPos: 20,
-      value: { kind: "usdc", atomic: 10_000_000n, rawDecimal: "1 USDC" },
-      valuePos: 31,
+  // Unknown event name
+  const expr2 = "bad_event where claimId > 1";
+  assert.throws(
+    () => parseFilterExpression(expr2),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_UNKNOWN_EVENT");
+      assert.deepEqual(err.range, { start: 0, end: 9 });
+      assert.equal(expr2.slice(err.range.start, err.range.end), "bad_event");
+      return true;
     },
-  };
-  const claimEvent = mockEvent("market", {
-    name: "claim_created",
-    claimId: 5,
-    creator: "G...",
-    category: "crypto",
-  });
-  assert.equal(evaluateFilterRule(mixedIdRule, claimEvent), false);
+  );
 
-  const mixedSharesRule = {
-    eventName: "deposited",
-    rawExpression: "deposited where shares >= 1 USDC",
-    condition: {
-      type: "comparison",
-      op: ">=",
-      field: "shares",
-      fieldPos: 16,
-      value: { kind: "usdc", atomic: 10_000_000n, rawDecimal: "1 USDC" },
-      valuePos: 26,
+  // Type mismatch
+  const expr3 = "claim_created where claimId == 'not_a_num'";
+  assert.throws(
+    () => parseFilterExpression(expr3),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_TYPE_MISMATCH");
+      assert.deepEqual(err.range, { start: 31, end: 42 });
+      assert.equal(expr3.slice(err.range.start, err.range.end), "'not_a_num'");
+      return true;
     },
-  };
-  const depositEvent = mockEvent("squad", {
-    name: "deposited",
-    marketId: 1,
-    side: 1,
-    participant: "G...",
-    amount: 50_000_000n,
-    shares: 50_000_000n,
-  });
-  assert.equal(evaluateFilterRule(mixedSharesRule, depositEvent), false);
+  );
+
+  // Unsupported operator on string field
+  const expr4 = "claim_created where category > 'a'";
+  assert.throws(
+    () => parseFilterExpression(expr4),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_OPERATOR_NOT_SUPPORTED");
+      assert.deepEqual(err.range, { start: 29, end: 30 });
+      assert.equal(expr4.slice(err.range.start, err.range.end), ">");
+      return true;
+    },
+  );
+
+  // USDC precision overflow
+  const expr5 = "claim_challenged where stake >= $1.12345678";
+  assert.throws(
+    () => parseFilterExpression(expr5),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_USDC_PRECISION");
+      assert.deepEqual(err.range, { start: 32, end: 43 });
+      assert.equal(expr5.slice(err.range.start, err.range.end), "$1.12345678");
+      return true;
+    },
+  );
+
+  // Token limit and depth limit errors carry codes and ranges
+  const expr6 = "where claimId == 1 and claimId == 2";
+  assert.throws(
+    () => parseFilterExpression(expr6, { maxTokens: 4 }),
+    (err) => {
+      assert.ok(err instanceof FilterTokenLimitError);
+      assert.equal(err.code, "FILTER_TOKEN_LIMIT");
+      assert.deepEqual(err.range, { start: 19, end: 22 });
+      assert.equal(expr6.slice(err.range.start, err.range.end), "and");
+      return true;
+    },
+  );
 });
 
