@@ -180,6 +180,10 @@ export interface StellarConfig {
   marketContractVersion: string;
   squadContractVersion: string;
   rpcUrl: string;
+  /** Optional operator-configured RPC egress allowlist (hosts, wildcards, or origins). */
+  rpcEgressAllowlist?: string[];
+  /** Permit credential-free loopback RPC URLs (used in mock mode). */
+  allowLoopbackRpc?: boolean;
   horizonUrl: string;
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
@@ -962,6 +966,15 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     horizonUrl: DEFAULTS.horizonUrl,
     passphrase: DEFAULTS.networkPassphrase,
   };
+
+  const rawAllowlist = c.get("STELLAR_RPC_EGRESS_ALLOWLIST");
+  const rpcEgressAllowlist =
+    rawAllowlist !== undefined
+      ? rawAllowlist
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+      : undefined;
 
   return {
     // Left unset when only a passphrase was given, so labels infer from it.
