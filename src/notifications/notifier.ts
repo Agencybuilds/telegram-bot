@@ -19,12 +19,17 @@ import type { Bot } from "grammy";
 import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
+  isTimeoutError,
   safeErrorMessage,
   splitTelegramMessage,
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
 import type { SendJournal } from "./send-journal.js";
+
+// Re-export isTimeoutError so callers that only import from notifier.ts
+// can classify timeout errors without also depending on format.ts directly.
+export { isTimeoutError } from "./format.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
 
@@ -64,15 +69,17 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
-  /** Optional Telegram forum topic id (`message_thread_id`) for single-route sends. */
-  topicId?: number | undefined;
-  /** Optional explicit list of destinations (each with chatId and optional topicId). */
-  destinations?: readonly NotificationDestination[] | undefined;
   /**
-   * When true and a `sendJournal` is attached, only send to destinations that
-   * have an unresolved intent in the journal for `eventRef.eventId`.
+   * Optional callback invoked when the send timed out before Telegram
+   * responded. The notification may or may not have been accepted — this is an
+   * **unknown outcome**, distinct from a confirmed rejection (4xx error).
+   * Callers that maintain a send journal should call `journal.recordTimeout(id)`
+   * inside this hook to flag the pending intent as a confirmed-unknown outcome
+   * so recovery tooling can distinguish it from a plain crash-recovery intent.
+   * The error that triggered the timeout is passed for bounded logging; never
+   * re-throw from this callback.
    */
-  recoverOnly?: boolean | undefined;
+  onTimeout?: ((err: unknown) => void) | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -372,6 +379,17 @@ export function createNotifier(
       });
       return;
     } catch (err) {
+      // When the HTTP call timed out, the notification may have been accepted
+      // by Telegram even though the client received no response. Notify the
+      // caller so it can flag the pending journal intent as an unknown outcome
+      // rather than a confirmed rejection, before the error propagates.
+      if (isTimeoutError(err) && typeof extra?.onTimeout === "function") {
+        try {
+          extra.onTimeout(err);
+        } catch {
+          // onTimeout must never interrupt the error path.
+        }
+      }
       // A blank fallback is no fallback: sending whitespace-only text would
       // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
