@@ -11,7 +11,7 @@ import test from "node:test";
 
 import { Address, Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 
-import { createNotifier } from "../dist/notifications/notifier.js";
+import { sanitizeTelegramError } from "../dist/notifications/notifier.js";
 import { createSendJournal } from "../dist/notifications/send-journal.js";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
@@ -264,148 +264,92 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
   }
 });
 
-// ── Orphaned journal recovery after configuration changes ────────────────────
+// ── Error sanitization and journal persistence ───────────────────────────────
 
-test("send journal: classifyPending identifies removed routes, changed networks, and legacy entries", async () => {
-  const dir = await createTempDataDir("mimir-journal-orphan-classify-");
-  try {
-    const journal = createSendJournal({
-      filePath: dir.file("journal.jsonl"),
-      now: () => 1_700_000_000_000,
-    });
+test("sanitizeTelegramError redacts secrets, bounds length, and retains stable errorCode", () => {
+  const secretSeed = "S" + "A".repeat(55);
+  const longSuffix = "x".repeat(300);
+  const err = {
+    error_code: 400,
+    description:
+      `Bad Request:\n  bot${BOT_TOKEN} https://user:pass@rpc.example.invalid/?token=abc ` +
+      `seed=${secretSeed} ${longSuffix}`,
+  };
 
-    // Legacy entry without route/network metadata stays valid for compatibility.
-    await journal.recordIntent({
-      id: "legacy-1",
-      source: "market",
-      ledger: 100,
-      eventName: "claim_created",
-      at: 100,
-    });
-    // Entry matching current config stays valid.
-    await journal.recordIntent({
-      id: "valid-1",
-      source: "market",
-      ledger: 101,
-      eventName: "claim_created",
-      chatId: "-100111",
-      networkPassphrase: "Test SDF Network ; September 2015",
-      at: 101,
-    });
-    // Entry whose route was removed/changed.
-    await journal.recordIntent({
-      id: "removed-route-1",
-      source: "squad",
-      ledger: 102,
-      eventName: "claim_created",
-      chatId: "-100999",
-      networkPassphrase: "Test SDF Network ; September 2015",
-      at: 102,
-    });
-    // Entry from a different network identity.
-    await journal.recordIntent({
-      id: "net-changed-1",
-      source: "market",
-      ledger: 103,
-      eventName: "claim_created",
-      chatId: "-100111",
-      networkPassphrase: "Public Global Stellar Network ; September 2015",
-      at: 103,
-    });
-
-    const { valid, orphaned } = await journal.classifyPending({
-      resolveRouteChatId: (source) => (source === "market" ? "-100111" : ""),
-      networkPassphrase: "Test SDF Network ; September 2015",
-    });
-
-    assert.deepEqual(
-      valid.map((e) => e.id),
-      ["legacy-1", "valid-1"],
-    );
-    assert.deepEqual(
-      orphaned.map((o) => ({ id: o.entry.id, reason: o.reason })),
-      [
-        { id: "removed-route-1", reason: "removed_route" },
-        { id: "net-changed-1", reason: "network_changed" },
-      ],
-    );
-  } finally {
-    await dir.cleanup();
-  }
+  const sanitized = sanitizeTelegramError(err, [BOT_TOKEN]);
+  assert.equal(sanitized.errorCode, 400);
+  assert.ok(!sanitized.description.includes(BOT_TOKEN), "bot token must be redacted");
+  assert.ok(!sanitized.description.includes(secretSeed), "secret seed must be redacted");
+  assert.ok(!sanitized.description.includes("user:pass"), "URL userinfo must be redacted");
+  assert.ok(!sanitized.description.includes("\n"), "newlines must be collapsed");
+  assert.ok(sanitized.description.length <= 240, "description must be bounded to 240 chars");
+  assert.ok(sanitized.description.endsWith("…"), "truncated description must end with ellipsis");
 });
 
-test("send journal: recoverOrphans applies explicit discard/reroute decisions and rejects empty reroutes", async () => {
-  const dir = await createTempDataDir("mimir-journal-orphan-recover-");
+test("sanitizeTelegramError handles non-object and missing-description boundary cases", () => {
+  const networkErr = Object.assign(new Error(`connect ETIMEDOUT https://u:p@host.invalid`), {
+    code: "ETIMEDOUT",
+  });
+  const s1 = sanitizeTelegramError(networkErr);
+  assert.equal(s1.errorCode, "ETIMEDOUT");
+  assert.ok(!s1.description.includes("u:p"), "URL credentials in Error.message must be redacted");
+
+  const emptyDesc = sanitizeTelegramError({ error_code: 429, description: "   " });
+  assert.equal(emptyDesc.errorCode, 429);
+  assert.equal(emptyDesc.description, "error code 429");
+
+  const nullErr = sanitizeTelegramError(null);
+  assert.equal(nullErr.errorCode, undefined);
+  assert.equal(nullErr.description, "unknown error");
+});
+
+test("send journal: recordError persists sanitized description, settles intent, and bounds errors on compact", async () => {
+  const dir = await createTempDataDir("mimir-journal-error-");
   const file = dir.file("journal.jsonl");
   try {
     const journal = createSendJournal({
       filePath: file,
-      now: () => 1_700_000_000_500,
+      maxEntries: 2,
+      maxBytes: 10_000,
+      now: () => 1_700_000_000_000,
+      secrets: [BOT_TOKEN],
     });
 
     await journal.recordIntent({
-      id: "orphan-discard",
+      id: "evt-fail-1",
       source: "market",
-      ledger: 200,
+      ledger: 6001,
       eventName: "claim_created",
-      chatId: "-100old",
-      networkPassphrase: "Old Net",
-      at: 200,
+      textHash: "hash1",
+      at: 1_700_000_000_000,
     });
-    await journal.recordIntent({
-      id: "orphan-reroute",
-      source: "squad",
-      ledger: 201,
+    await journal.recordError({
+      id: "evt-fail-1",
+      source: "market",
+      ledger: 6001,
       eventName: "claim_created",
-      chatId: "-100old-squad",
-      networkPassphrase: "Test SDF Network ; September 2015",
-      at: 201,
+      error: {
+        error_code: 403,
+        description: `Forbidden: bot${BOT_TOKEN} was blocked by the user ${"z".repeat(300)}`,
+      },
     });
 
-    const context = {
-      resolveRouteChatId: (source) => (source === "squad" ? "-100new-squad" : "-100new-market"),
-      networkPassphrase: "Test SDF Network ; September 2015",
-    };
+    // An errored send settles its intent so recovery does not treat it as maybe-sent.
+    assert.deepEqual(await journal.loadPending(), []);
 
-    const result = await journal.recoverOrphans(context, (orphan) => {
-      if (orphan.entry.id === "orphan-discard") return { action: "discard" };
-      return { action: "reroute" };
-    });
+    const raw = await readFile(file, "utf8");
+    assert.ok(!raw.includes(BOT_TOKEN), "raw bot token must never be persisted to journal");
+    const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
+    const errEntry = lines.find((e) => e.kind === "error");
+    assert.ok(errEntry, "error entry should be persisted");
+    assert.equal(errEntry.errorCode, 403);
+    assert.ok(errEntry.errorDescription.length <= 240);
+    assert.ok(errEntry.errorDescription.includes("[REDACTED]"));
 
-    assert.equal(result.discarded, 1);
-    assert.equal(result.rerouted, 1);
-    assert.equal(result.reroutedEntries[0].id, "orphan-reroute");
-    assert.equal(result.reroutedEntries[0].chatId, "-100new-squad");
-
-    const after = await journal.classifyPending(context);
-    assert.deepEqual(
-      after.valid.map((e) => e.id),
-      ["orphan-reroute"],
-      "rerouted entry is now valid under the new config and discarded entry is gone",
-    );
-    assert.deepEqual(after.orphaned, []);
-
-    // Boundary case: rerouting to an empty route throws instead of silently dropping/replaying.
-    await journal.recordIntent({
-      id: "orphan-empty-target",
-      source: "squad",
-      ledger: 202,
-      eventName: "claim_created",
-      chatId: "-100gone",
-      networkPassphrase: "Test SDF Network ; September 2015",
-      at: 202,
-    });
-    await assert.rejects(
-      () =>
-        journal.recoverOrphans(
-          {
-            resolveRouteChatId: () => "",
-            networkPassphrase: "Test SDF Network ; September 2015",
-          },
-          () => ({ action: "reroute" }),
-        ),
-      /target route is empty/,
-    );
+    // Additional errors compact within maxEntries.
+    await journal.recordError({ id: "evt-fail-2", error: { error_code: 429, description: "Too Many Requests" } });
+    await journal.recordError({ id: "evt-fail-3", error: { error_code: 500, description: "Internal Server Error" } });
+    assert.ok((await journal.stats()).entries <= 2, "compaction bounds retained error entries");
   } finally {
     await dir.cleanup();
   }

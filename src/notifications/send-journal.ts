@@ -21,6 +21,8 @@
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
+import { sanitizeTelegramError } from "./notifier.js";
+
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
 
@@ -32,7 +34,7 @@ export interface JournalDestination {
 }
 
 export interface JournalEntry {
-  kind: "intent" | "done";
+  kind: "intent" | "done" | "error";
   id: string;
   source: string;
   ledger: number;
@@ -45,10 +47,10 @@ export interface JournalEntry {
   outcome?: DeliveryOutcome;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
-  /** Resolved Telegram chat route at the time the intent was recorded. */
-  chatId?: string;
-  /** Stellar network passphrase at the time the intent was recorded. */
-  networkPassphrase?: string;
+  /** Stable error code for operator triage (e.g. Telegram error_code 400, 429). */
+  errorCode?: number | string;
+  /** Sanitized, redacted, and length-bounded error description. */
+  errorDescription?: string;
   at: number;
 }
 
@@ -87,6 +89,8 @@ export interface SendJournalOptions {
   maxEntries?: number;
   maxBytes?: number;
   now?: () => number;
+  /** Known secrets (e.g. botToken) to redact from persisted error descriptions. */
+  secrets?: readonly string[];
 }
 
 export interface SendJournalStats {
@@ -107,12 +111,17 @@ export interface SendJournal {
     networkPassphrase?: string;
     at: number;
   }): Promise<void>;
-  recordDone(
-    id: string,
-    destination?: JournalDestination,
-    outcome?: DeliveryOutcome,
-  ): Promise<void>;
-  /** Intents with no matching done: notifications/destinations that may have been sent. */
+  recordDone(id: string): Promise<void>;
+  recordError(entry: {
+    id: string;
+    source?: string;
+    ledger?: number;
+    eventName?: string;
+    error: unknown;
+    secrets?: readonly string[];
+    at?: number;
+  }): Promise<void>;
+  /** Intents with no matching done or error: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   /** Partition pending entries into valid vs orphaned (removed route / changed network). */
   classifyPending(context: JournalRecoveryContext): Promise<{
@@ -254,148 +263,55 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     }
   }
 
+  async function recordError(entry: {
+    id: string;
+    source?: string;
+    ledger?: number;
+    eventName?: string;
+    error: unknown;
+    secrets?: readonly string[];
+    at?: number;
+  }): Promise<void> {
+    const secrets = [...(options.secrets ?? []), ...(entry.secrets ?? [])];
+    const sanitized = sanitizeTelegramError(entry.error, secrets);
+    await append({
+      kind: "error",
+      id: entry.id,
+      source: entry.source ?? "",
+      ledger: entry.ledger ?? 0,
+      eventName: entry.eventName ?? "",
+      ...(sanitized.errorCode !== undefined ? { errorCode: sanitized.errorCode } : {}),
+      errorDescription: sanitized.description,
+      at: entry.at ?? now(),
+    });
+    const stats = await journalStats();
+    if (stats.entries > maxEntries || stats.bytes > maxBytes) {
+      await compact();
+    }
+  }
+
   async function loadPending(): Promise<JournalEntry[]> {
     const entries = await readLines();
-    const done = new Set<string>();
+    const settled = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") {
-        done.add(entryKey(entry.id, entry.chatId, entry.topicId));
-      }
+      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
     }
-    return entries.filter(
-      (e) => e.kind === "intent" && !done.has(entryKey(e.id, e.chatId, e.topicId)),
-    );
-  }
-
-  async function loadPendingForEvent(id: string): Promise<JournalEntry[]> {
-    const pending = await loadPending();
-    return pending.filter((e) => e.id === id);
-  }
-
-  async function classifyPending(context: JournalRecoveryContext): Promise<{
-    valid: JournalEntry[];
-    orphaned: OrphanedJournalEntry[];
-  }> {
-    const pending = await loadPending();
-    const valid: JournalEntry[] = [];
-    const orphaned: OrphanedJournalEntry[] = [];
-
-    for (const entry of pending) {
-      if (
-        entry.networkPassphrase &&
-        context.networkPassphrase &&
-        entry.networkPassphrase !== context.networkPassphrase
-      ) {
-        orphaned.push({
-          entry,
-          reason: "network_changed",
-          currentNetworkPassphrase: context.networkPassphrase,
-          ...(context.resolveRouteChatId
-            ? { currentChatId: context.resolveRouteChatId(entry.source) }
-            : {}),
-        });
-        continue;
-      }
-
-      if (entry.chatId && context.resolveRouteChatId) {
-        const currentChatId = context.resolveRouteChatId(entry.source);
-        if (!currentChatId || currentChatId !== entry.chatId) {
-          orphaned.push({
-            entry,
-            reason: "removed_route",
-            currentChatId,
-            ...(context.networkPassphrase
-              ? { currentNetworkPassphrase: context.networkPassphrase }
-              : {}),
-          });
-          continue;
-        }
-      }
-
-      valid.push(entry);
-    }
-
-    return { valid, orphaned };
-  }
-
-  async function recoverOrphans(
-    context: JournalRecoveryContext,
-    decide: (orphan: OrphanedJournalEntry) => OrphanDecision | Promise<OrphanDecision>,
-  ): Promise<OrphanRecoveryResult> {
-    const { valid, orphaned } = await classifyPending(context);
-    if (orphaned.length === 0) {
-      return { valid, orphaned: [], discarded: 0, rerouted: 0, reroutedEntries: [] };
-    }
-
-    const entries = await readLines();
-    const doneIds = new Set<string>();
-    const rerouteMap = new Map<string, JournalEntry>();
-    let discarded = 0;
-    let rerouted = 0;
-    const reroutedEntries: JournalEntry[] = [];
-
-    for (const orphan of orphaned) {
-      const decision = await decide(orphan);
-      if (decision.action === "discard") {
-        doneIds.add(orphan.entry.id);
-        discarded += 1;
-      } else if (decision.action === "reroute") {
-        const nextChatId = decision.chatId ?? orphan.currentChatId ?? "";
-        if (!nextChatId) {
-          throw new Error(
-            `Cannot reroute orphaned journal entry ${orphan.entry.id}: target route is empty`,
-          );
-        }
-        const nextNetwork =
-          decision.networkPassphrase ??
-          context.networkPassphrase ??
-          orphan.entry.networkPassphrase;
-        const updated: JournalEntry = {
-          ...orphan.entry,
-          chatId: nextChatId,
-          ...(nextNetwork ? { networkPassphrase: nextNetwork } : {}),
-          at: now(),
-        };
-        rerouteMap.set(orphan.entry.id, updated);
-        rerouted += 1;
-        reroutedEntries.push(updated);
-      } else {
-        throw new Error(
-          `Invalid orphan decision for ${orphan.entry.id}: expected "discard" or "reroute"`,
-        );
-      }
-    }
-
-    const nextEntries: JournalEntry[] = [];
-    for (const entry of entries) {
-      if (entry.kind === "intent" && doneIds.has(entry.id)) {
-        continue;
-      }
-      if (entry.kind === "intent" && rerouteMap.has(entry.id)) {
-        nextEntries.push(rerouteMap.get(entry.id)!);
-        continue;
-      }
-      nextEntries.push(entry);
-    }
-    await persist(nextEntries);
-
-    return { valid, orphaned, discarded, rerouted, reroutedEntries };
+    return entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
   }
 
   async function compact(): Promise<void> {
     const entries = await readLines();
-    const done = new Set<string>();
+    const settled = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") {
-        done.add(entryKey(entry.id, entry.chatId, entry.topicId));
-      }
+      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
     }
-    // A done line settles its intent: both lines can be dropped. Keep only
-    // unresolved intents.
-    const unresolved = entries.filter(
-      (e) => e.kind === "intent" && !done.has(entryKey(e.id, e.chatId, e.topicId)),
-    );
-    await persist(unresolved);
+    // A done or error line settles its intent: both intent+done can be dropped.
+    // Keep unresolved intents and recent error entries (bounded to maxEntries).
+    const unresolved = entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
+    const errors = entries.filter((e) => e.kind === "error");
+    const errorBudget = Math.max(0, maxEntries - unresolved.length);
+    const keptErrors = errorBudget > 0 ? errors.slice(-errorBudget) : [];
+    await persist([...unresolved, ...keptErrors]);
   }
 
   async function journalStats(): Promise<SendJournalStats> {
@@ -417,5 +333,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, classifyPending, recoverOrphans, compact, stats };
+  return { recordIntent, recordDone, recordError, loadPending, compact, stats };
 }
