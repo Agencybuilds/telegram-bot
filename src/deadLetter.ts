@@ -93,6 +93,51 @@ export interface DeadLetterQueueOptions {
   networkPassphrase?: string;
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /**
+   * When `true`, validation errors during `load()` (such as duplicate entry
+   * IDs) throw instead of logging a warning and starting empty. The source
+   * file is always preserved untouched in either mode.
+   */
+  strict?: boolean;
+}
+
+export class DeadLetterDuplicateIdError extends Error {
+  readonly filePath: string | null;
+  readonly duplicateIds: string[];
+
+  constructor(filePath: string | null, duplicateIds: readonly string[]) {
+    const location = filePath ? ` in ${filePath}` : "";
+    super(
+      `duplicate dead-letter entry id(s)${location}: ${duplicateIds.join(", ")}; ` +
+        `source file preserved for inspection`,
+    );
+    this.name = "DeadLetterDuplicateIdError";
+    this.filePath = filePath;
+    this.duplicateIds = [...duplicateIds];
+  }
+}
+
+/**
+ * Return any duplicate entry IDs in first-seen conflict order.
+ * An empty array means all entry IDs are unique.
+ */
+export function findDuplicateEntryIds(
+  entries: readonly Pick<DeadLetterEntry, "id">[],
+): string[] {
+  const seen = new Set<string>();
+  const recorded = new Set<string>();
+  const duplicates: string[] = [];
+  for (const entry of entries) {
+    if (seen.has(entry.id)) {
+      if (!recorded.has(entry.id)) {
+        recorded.add(entry.id);
+        duplicates.push(entry.id);
+      }
+    } else {
+      seen.add(entry.id);
+    }
+  }
+  return duplicates;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
@@ -174,6 +219,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
   let entries: DeadLetterEntry[] = [];
+  let sourcePreserved = false;
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
@@ -190,9 +236,8 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     stats.depth = entries.length;
   }
 
-  async function load(loadOptions: DeadLetterLoadOptions = {}): Promise<void> {
-    const strict = loadOptions.strict === true;
-    const quiet = loadOptions.quiet === true;
+  async function load(): Promise<void> {
+    sourcePreserved = false;
     if (filePath === null) {
       entries = [];
       syncDepth();
@@ -236,23 +281,14 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         );
         entries = [];
       } else {
-        const rawEntries = (parsed as DeadLetterFile).entries;
-        const validEntry = (e: unknown): e is DeadLetterEntry =>
-          Boolean(
-            e &&
-              typeof e === "object" &&
-              !Array.isArray(e) &&
-              typeof (e as DeadLetterEntry).id === "string" &&
-              typeof (e as DeadLetterEntry).text === "string" &&
-              typeof (e as DeadLetterEntry).ledger === "number",
-          );
-        if (strict && rawEntries.some((e) => !validEntry(e))) {
-          throw new DeadLetterMalformedError(
-            `malformed dead-letter entry in ${filePath}: expected id, text, and ledger`,
-          );
-        }
-        entries = rawEntries
-          .filter(validEntry)
+        const candidateEntries = parsed.entries
+          .filter(
+            (e) =>
+              e &&
+              typeof e.id === "string" &&
+              typeof e.text === "string" &&
+              typeof e.ledger === "number",
+          )
           .map((e) => ({
             id: e.id,
             enqueuedAt:
@@ -267,6 +303,24 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
               ? { networkPassphrase: e.networkPassphrase }
               : {}),
           }));
+
+        // Reject conflicting duplicate IDs before trimming to maxEntries so an
+        // older duplicate is never silently discarded, and preserve the source
+        // file for inspection rather than overwriting it.
+        const duplicateIds = findDuplicateEntryIds(candidateEntries);
+        if (duplicateIds.length > 0) {
+          entries = [];
+          sourcePreserved = true;
+          syncDepth();
+          const err = new DeadLetterDuplicateIdError(filePath, duplicateIds);
+          if (options.strict) {
+            throw err;
+          }
+          console.warn(`[dead-letter] ${safeError(err)}; starting empty`);
+          return;
+        }
+
+        entries = candidateEntries;
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
           entries.shift();
@@ -274,12 +328,8 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
-      if (strict) {
-        if (err instanceof DeadLetterMalformedError) throw err;
-        throw new DeadLetterMalformedError(
-          `malformed dead-letter file at ${filePath}: ${safeError(err)}`,
-          { cause: err },
-        );
+      if (err instanceof DeadLetterDuplicateIdError) {
+        throw err;
       }
       console.warn(
         `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
@@ -294,6 +344,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
 
   async function persist(): Promise<void> {
     if (filePath === null) {
+      syncDepth();
+      return;
+    }
+    if (sourcePreserved) {
+      console.warn(
+        `[dead-letter] refusing to overwrite ${filePath} while duplicate-id conflict is unresolved`,
+      );
       syncDepth();
       return;
     }

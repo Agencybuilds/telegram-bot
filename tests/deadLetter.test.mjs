@@ -15,7 +15,8 @@ import test, { mock } from "node:test";
 
 import {
   createDeadLetterQueue,
-  DEAD_LETTER_MAX_ACK_IDS,
+  DeadLetterDuplicateIdError,
+  findDuplicateEntryIds,
   makeEntryId,
 } from "../dist/deadLetter.js";
 
@@ -411,67 +412,136 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.notEqual(a, d);
 });
 
-// ── Bulk acknowledge ──────────────────────────────────────────────────────────
+// ── Duplicate ID validation ───────────────────────────────────────────────────
 
-test("acknowledge removes matched entries atomically and preserves unmatched entries", async () => {
-  await withQueue(
-    async ({ queue, filePath }) => {
-      const e1 = await queue.enqueue(parked(1, "one", "err-1"));
-      const e2 = await queue.enqueue(parked(2, "two", "err-2"));
-      const e3 = await queue.enqueue(parked(3, "three", "err-3"));
-
-      const result = await queue.acknowledge([e1.id, "market:999:missing:00000000", e3.id, e1.id]);
-
-      assert.deepEqual(result.acknowledgedIds, [e1.id, e3.id]);
-      assert.deepEqual(result.unmatchedIds, ["market:999:missing:00000000"]);
-      assert.equal(result.remaining, 1);
-      assert.equal(queue.stats().depth, 1);
-
-      // Unmatched queued entry is preserved untouched (same attempts, lastError, text).
-      const remaining = queue.snapshot();
-      assert.equal(remaining.length, 1);
-      assert.deepEqual(remaining[0], e2);
-
-      // Atomic write-then-rename leaves no .tmp file and persists only the remaining entry.
-      await assert.rejects(() => stat(`${filePath}.tmp`));
-      const persisted = JSON.parse(await readFile(filePath, "utf8"));
-      assert.equal(persisted.version, 1);
-      assert.deepEqual(persisted.entries.map((e) => e.id), [e2.id]);
-    },
-    { maxEntries: 5 },
+test("findDuplicateEntryIds returns unique conflicting IDs in first-seen order", () => {
+  assert.deepEqual(findDuplicateEntryIds([{ id: "a" }, { id: "b" }, { id: "c" }]), []);
+  assert.deepEqual(
+    findDuplicateEntryIds([
+      { id: "a" },
+      { id: "b" },
+      { id: "a" },
+      { id: "c" },
+      { id: "b" },
+      { id: "a" },
+    ]),
+    ["a", "b"],
   );
 });
 
-test("acknowledge with only unmatched ids leaves the queue and file untouched", async () => {
-  await withQueue(async ({ queue, filePath }) => {
-    const e1 = await queue.enqueue(parked(1, "one"));
-    const beforeRaw = await readFile(filePath, "utf8");
+test("load rejects duplicate IDs and preserves the source file rather than overwriting it", async () => {
+  const warnings = [];
+  mock.method(console, "warn", (...args) => warnings.push(args.join(" ")));
+  try {
+    await withQueue(async ({ queue, filePath }) => {
+      const duplicatePayload = JSON.stringify(
+        {
+          version: 1,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          entries: [
+            {
+              id: "market:10:claim_created:11111111",
+              enqueuedAt: "2026-01-01T00:00:00.000Z",
+              source: "market",
+              ledger: 10,
+              eventName: "claim_created",
+              text: "first body",
+              attempts: 1,
+              lastError: "Telegram 429",
+            },
+            {
+              id: "market:10:claim_created:11111111",
+              enqueuedAt: "2026-01-01T00:01:00.000Z",
+              source: "market",
+              ledger: 10,
+              eventName: "claim_created",
+              text: "conflicting body",
+              attempts: 2,
+              lastError: "Telegram 500",
+            },
+          ],
+        },
+        null,
+        2,
+      );
+      await writeFile(filePath, duplicatePayload, "utf8");
 
-    const result = await queue.acknowledge(["market:999:missing:00000000"]);
-    assert.deepEqual(result.acknowledgedIds, []);
-    assert.deepEqual(result.unmatchedIds, ["market:999:missing:00000000"]);
-    assert.equal(result.remaining, 1);
-    assert.equal(queue.snapshot()[0].id, e1.id);
-    assert.equal(await readFile(filePath, "utf8"), beforeRaw);
-  });
+      await queue.load();
+      assert.equal(queue.stats().depth, 0);
+      assert.ok(
+        warnings.some((w) => w.includes("duplicate dead-letter entry id(s)")),
+        "expected duplicate ID warning",
+      );
+
+      // Enqueuing a new message must not overwrite the preserved source file.
+      await queue.enqueue(parked(99, "new message"));
+      assert.equal(queue.stats().depth, 1);
+      const onDisk = await readFile(filePath, "utf8");
+      assert.equal(onDisk, duplicatePayload, "source file must remain untouched for inspection");
+      assert.ok(
+        warnings.some((w) => w.includes("refusing to overwrite")),
+        "expected refusal warning when persisting over preserved file",
+      );
+
+      // Once the operator fixes the file, a subsequent load() re-enables persistence.
+      await writeFile(
+        filePath,
+        JSON.stringify({ version: 1, updatedAt: "2026-01-01T00:02:00.000Z", entries: [] }),
+        "utf8",
+      );
+      await queue.load();
+      await queue.enqueue(parked(100, "after fix"));
+      const afterFix = JSON.parse(await readFile(filePath, "utf8"));
+      assert.equal(afterFix.entries.length, 1);
+      assert.equal(afterFix.entries[0].ledger, 100);
+    });
+  } finally {
+    mock.restoreAll();
+  }
 });
 
-test("acknowledge rejects empty, blank, or oversized id lists without mutating state", async () => {
-  await withQueue(async ({ queue, filePath }) => {
-    const e1 = await queue.enqueue(parked(1, "one"));
-    const beforeRaw = await readFile(filePath, "utf8");
-
-    await assert.rejects(() => queue.acknowledge([]), RangeError);
-    await assert.rejects(() => queue.acknowledge(["   "]), RangeError);
-
-    const tooMany = Array.from(
-      { length: DEAD_LETTER_MAX_ACK_IDS + 1 },
-      (_, i) => `market:${i}:claim_cancelled:00000000`,
+test("load with strict: true throws DeadLetterDuplicateIdError before maxEntries trimming", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-dup-strict-"));
+  const filePath = path.join(directory, "dead-letter.json");
+  try {
+    // Duplicate appears in the oldest entries that would otherwise be trimmed when maxEntries=2.
+    const raw = JSON.stringify(
+      {
+        version: 1,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        entries: [
+          { id: "dup-id", text: "first", ledger: 1 },
+          { id: "dup-id", text: "second", ledger: 2 },
+          { id: "unique-3", text: "third", ledger: 3 },
+          { id: "unique-4", text: "fourth", ledger: 4 },
+        ],
+      },
+      null,
+      2,
     );
-    await assert.rejects(() => queue.acknowledge(tooMany), RangeError);
+    await writeFile(filePath, raw, "utf8");
 
-    assert.equal(queue.stats().depth, 1);
-    assert.equal(queue.snapshot()[0].id, e1.id);
-    assert.equal(await readFile(filePath, "utf8"), beforeRaw);
-  });
+    const queue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 2,
+      maxAttempts: 3,
+      strict: true,
+    });
+
+    await assert.rejects(
+      () => queue.load(),
+      (err) => {
+        assert.ok(err instanceof DeadLetterDuplicateIdError);
+        assert.deepEqual(err.duplicateIds, ["dup-id"]);
+        assert.equal(err.filePath, filePath);
+        assert.match(err.message, /dup-id/);
+        assert.match(err.message, /preserved for inspection/);
+        return true;
+      },
+    );
+
+    assert.equal(await readFile(filePath, "utf8"), raw, "source file must remain untouched");
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
 });

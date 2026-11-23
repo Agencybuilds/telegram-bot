@@ -314,6 +314,7 @@ function openQueue(options: ListDlqOptions) {
     maxAttempts,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    strict: true,
   });
 }
 
@@ -1047,7 +1048,12 @@ export async function runDlqCli(
       errOut(`[dlq] ${boundText(err.message, 300)}`);
       return { exitCode: DLQ_EXIT_CODES.ACCESS_ERROR };
     }
-    const message = err instanceof Error ? err.message : "dlq command failed";
+    const rawMessage = err instanceof Error ? err.message : "dlq command failed";
+    const message = sanitizeDlqText(
+      rawMessage,
+      configuredChatIds(parsed.chatId),
+      configuredSecrets(),
+    );
     errOut(`[dlq] ${boundText(message, 300)}`);
     return { exitCode: DLQ_EXIT_CODES.ACCESS_ERROR };
   }
