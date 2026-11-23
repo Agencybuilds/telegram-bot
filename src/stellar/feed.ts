@@ -26,11 +26,16 @@ export const FEED_CONTENT_MAX_CHARS = 2_000;
 export const FEED_TITLE_MAX_CHARS = 500;
 
 /**
- * Explicit RFC 3339 timestamp used when an event or feed has no known ledger
- * close time, avoiding assigning process startup / wall-clock time to
- * historical or timeless entries.
+ * Deterministic fallback `<updated>` timestamp (Unix epoch) used when a feed
+ * has no events or no event carries a valid positive `at` timestamp.
  */
-export const UNKNOWN_EVENT_TIMESTAMP = new Date(0).toISOString();
+export const FEED_EPOCH_UPDATED_AT = "1970-01-01T00:00:00.000Z";
+
+/**
+ * Extension XML namespace for Mimir-specific Atom feed metadata such as
+ * `<mimir:generated>` (RFC 4287 §6).
+ */
+export const MIMIR_FEED_NS = "https://mimir.stellar.org/ns/feed";
 
 /**
  * Escape the five XML predefined entities so a string is safe inside any
@@ -301,12 +306,19 @@ export interface AtomFeedOptions {
   /** StellarConfig, forwarded to formatPlainTextEvent and eventExplorerUrl. */
   config: StellarConfig;
   /**
-   * Override the feed's `<updated>` timestamp (ISO 8601 / RFC 3339).
-   * Defaults to the `at` field of the most-recent event, or
-   * {@link UNKNOWN_EVENT_TIMESTAMP} (`1970-01-01T00:00:00.000Z`) when no
-   * event has a valid ledger timestamp or the events array is empty.
+   * Override the feed's `<updated>` timestamp (ISO 8601 / RFC 3339), which
+   * represents the last event update time.
+   * Defaults to the `at` field of the most-recent event with `at > 0`, or
+   * {@link FEED_EPOCH_UPDATED_AT} (`1970-01-01T00:00:00.000Z`) when the
+   * events array is empty or contains no valid event timestamps.
    */
   updatedAt?: string;
+  /**
+   * Timestamp when this feed document was generated (ISO 8601 / RFC 3339).
+   * Emitted separately from `<updated>` as `<mimir:generated>` so regenerating
+   * an empty or unchanged feed does not advance `<updated>`.
+   */
+  generatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
   /**
@@ -315,6 +327,55 @@ export interface AtomFeedOptions {
    * produce identical output.
    */
   filter?: FeedFilter;
+}
+
+export interface AtomFeedMetadata {
+  /**
+   * Last event update time (RFC 3339), emitted as Atom `<updated>`.
+   * Derived from `options.updatedAt`, otherwise the max `event.at > 0`,
+   * otherwise {@link FEED_EPOCH_UPDATED_AT}.
+   */
+  updatedAt: string;
+  /**
+   * Feed document generation time (RFC 3339), emitted as `<mimir:generated>`
+   * when provided. Distinct from `updatedAt` so empty or unchanged feeds keep
+   * a stable `<updated>` timestamp across regenerations.
+   */
+  generatedAt: string | null;
+  /** Number of entries in the feed. */
+  entryCount: number;
+  /** True when the feed contains no entries. */
+  isEmpty: boolean;
+}
+
+/**
+ * Resolve feed-level timestamp and cardinality metadata without consulting
+ * wall-clock time, keeping empty and unchanged feeds deterministic.
+ */
+export function resolveAtomFeedMetadata(
+  events: readonly DecodedEvent[],
+  options: Pick<AtomFeedOptions, "updatedAt" | "generatedAt"> = {},
+): AtomFeedMetadata {
+  let updatedAt: string;
+  if (options.updatedAt) {
+    updatedAt = options.updatedAt;
+  } else if (events.length > 0) {
+    const maxAt = events.reduce(
+      (best, e) =>
+        typeof e.at === "number" && Number.isFinite(e.at) && e.at > best ? e.at : best,
+      0,
+    );
+    updatedAt = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : FEED_EPOCH_UPDATED_AT;
+  } else {
+    updatedAt = FEED_EPOCH_UPDATED_AT;
+  }
+
+  return {
+    updatedAt,
+    generatedAt: options.generatedAt ? options.generatedAt : null,
+    entryCount: events.length,
+    isEmpty: events.length === 0,
+  };
 }
 
 /**
@@ -402,9 +463,12 @@ function renderEntry(entry: AtomEntry): string {
  * Build a complete Atom 1.0 feed document string from an array of decoded events.
  *
  * - `<feed id>` is the `selfUrl`.
- * - `<updated>` is the most recent `event.at` timestamp, or `updatedAt` when
- *   provided, or {@link UNKNOWN_EVENT_TIMESTAMP} (`1970-01-01T00:00:00.000Z`)
- *   when no event has a valid ledger timestamp or the event array is empty.
+ * - `<updated>` is the last event update time: `updatedAt` when provided,
+ *   otherwise the most recent positive `event.at` timestamp, otherwise
+ *   {@link FEED_EPOCH_UPDATED_AT} (`1970-01-01T00:00:00.000Z`) so empty or
+ *   unchanged feeds remain deterministic.
+ * - `<mimir:generated>` is emitted separately when `generatedAt` is provided,
+ *   recording feed generation time without altering `<updated>`.
  * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
  *   get an entry (with an empty `<content/>`), so feed readers always see the
  *   full event count.
@@ -420,17 +484,46 @@ export function buildAtomFeed(
   options: AtomFeedOptions,
 ): string {
   const { title, selfUrl, config, subtitle } = options;
+  const metadata = resolveAtomFeedMetadata(events, options);
+  const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
 
-  const normalizedFilter = normalizeFeedFilter(options.filter);
-  const filteredEvents = normalizedFilter
-    ? events.filter((event) => matchesFeedFilter(event, normalizedFilter))
-    : events;
+  const feedOpenTag =
+    metadata.generatedAt !== null
+      ? `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:mimir="${MIMIR_FEED_NS}">`
+      : '<feed xmlns="http://www.w3.org/2005/Atom">';
 
-  // Feed <updated>: caller override → latest event.at → now.
-  let feedUpdated: string;
-  if (options.updatedAt) {
-    feedUpdated = options.updatedAt;
-  } else if (filteredEvents.length > 0) {
-    const maxAt = filteredEvents.
+  const lines: string[] = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    feedOpenTag,
+    `  <title type="text">${xmlText(title, FEED_TITLE_MAX_CHARS)}</title>`,
+  ];
 
-/* … truncated 1019 chars — edit only what you need near the top … */
+  if (subtitle) {
+    lines.push(`  <subtitle type="text">${xmlText(subtitle, FEED_TITLE_MAX_CHARS)}</subtitle>`);
+  }
+
+  lines.push(
+    `  <id>${escapeXml(validSelfUrl || selfUrl)}</id>`,
+    `  <updated>${escapeXml(stripXmlIllegal(metadata.updatedAt))}</updated>`,
+  );
+
+  if (metadata.generatedAt !== null) {
+    lines.push(
+      `  <mimir:generated>${escapeXml(stripXmlIllegal(metadata.generatedAt))}</mimir:generated>`,
+    );
+  }
+
+  if (validSelfUrl) {
+    lines.push(
+      `  <link rel="self" type="application/atom+xml" href="${escapeXml(validSelfUrl)}"/>`,
+    );
+  }
+
+  for (const event of events) {
+    const entry = buildAtomEntry(event, config);
+    lines.push(renderEntry(entry));
+  }
+
+  lines.push("</feed>");
+  return lines.join("\n");
+}
