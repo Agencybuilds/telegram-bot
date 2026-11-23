@@ -17,6 +17,8 @@
  *     `evaluateFilterRule` keeps its existing boolean allow-or-deny contract.
  */
 
+import { createHash } from "node:crypto";
+
 import type { DecodedEvent } from "../stellar/decode.js";
 import {
   evaluateThresholdDiagnostic,
@@ -30,6 +32,12 @@ import {
 export const USDC_SCALE = 10_000_000n;
 
 /**
+ * Current normalized schema version for notification filter compilation.
+ * Bumped when the schema structure or normalization rules change incompatibly.
+ */
+export const FILTER_SCHEMA_VERSION = 1;
+
+/**
  * Expected schema type for fields.
  */
 export type FieldType = "string" | "number" | "bigint" | "boolean";
@@ -39,6 +47,14 @@ export interface FieldDefinition {
   /** Whether the field is an amount in atomic 7-decimal USDC units. */
   isUsdcAmount?: boolean;
 }
+
+export interface NormalizedFieldDefinition {
+  isUsdcAmount: boolean;
+  type: FieldType;
+}
+
+export type NormalizedEventSchema = Record<string, NormalizedFieldDefinition>;
+export type NormalizedSchemaRegistry = Record<string, NormalizedEventSchema>;
 
 /**
  * Known fields and types for each event payload name.
@@ -170,103 +186,153 @@ export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinitio
   },
 };
 
-/**
- * Known non-payload metadata fields that may appear in event-less filter expressions.
- */
-const METADATA_FIELD_SCHEMAS: Record<string, FieldDefinition> = {
-  ledger: { type: "number" },
-};
+// ----------------------------------------------------
+// Schema Normalization and Fingerprinting
+// ----------------------------------------------------
 
 /**
- * Unified field lookup across all event payload schemas and metadata fields,
- * used when a filter expression omits the event name.
+ * Normalizes a schema version input into a positive integer.
+ * Accepts positive numbers or strings (e.g. "1", "v1", "v1.0").
  */
-const GLOBAL_FIELD_SCHEMAS: Record<string, FieldDefinition> = (() => {
-  const combined: Record<string, FieldDefinition> = { ...METADATA_FIELD_SCHEMAS };
-  for (const schema of Object.values(EVENT_PAYLOAD_SCHEMAS)) {
-    for (const [field, def] of Object.entries(schema)) {
-      if (!(field in combined)) {
-        combined[field] = def;
-      }
+export function normalizeSchemaVersion(version: number | string = FILTER_SCHEMA_VERSION): number {
+  if (typeof version === "number") {
+    if (!Number.isFinite(version) || version <= 0) {
+      throw new Error(`Invalid schema version: ${version}`);
+    }
+    return Math.floor(version);
+  }
+  if (typeof version === "string") {
+    const cleaned = version.trim().replace(/^[vV]/, "");
+    const parsed = parseInt(cleaned, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error(`Invalid schema version string: "${version}"`);
+    }
+    return parsed;
+  }
+  throw new Error(`Schema version must be a number or string, got ${typeof version}`);
+}
+
+/**
+ * Normalizes a single field definition to canonical form.
+ */
+export function normalizeFieldDefinition(def: FieldDefinition): NormalizedFieldDefinition {
+  return {
+    isUsdcAmount: Boolean(def.isUsdcAmount),
+    type: def.type,
+  };
+}
+
+/**
+ * Normalizes an event payload schema by sorting field names and canonicalizing definitions.
+ */
+export function normalizeEventSchema(
+  schema: Record<string, FieldDefinition>,
+): NormalizedEventSchema {
+  const sortedKeys = Object.keys(schema).sort();
+  const normalized: NormalizedEventSchema = {};
+  for (const key of sortedKeys) {
+    const field = schema[key];
+    if (field) {
+      normalized[key] = normalizeFieldDefinition(field);
     }
   }
-  return combined;
-})();
+  return normalized;
+}
 
-function getFieldDefinition(eventName: string | undefined, field: string): FieldDefinition | undefined {
-  if (eventName) {
-    return EVENT_PAYLOAD_SCHEMAS[eventName]?.[field];
+/**
+ * Normalizes a full event schema registry by sorting event names and fields.
+ */
+export function normalizeSchemaRegistry(
+  schemas: Record<string, Record<string, FieldDefinition>>,
+): NormalizedSchemaRegistry {
+  const sortedEvents = Object.keys(schemas).sort();
+  const normalized: NormalizedSchemaRegistry = {};
+  for (const eventName of sortedEvents) {
+    const eventSchema = schemas[eventName];
+    if (eventSchema) {
+      normalized[eventName] = normalizeEventSchema(eventSchema);
+    }
   }
-  return GLOBAL_FIELD_SCHEMAS[field];
+  return normalized;
 }
 
-/** Maximum allowed non-EOF tokens in a single filter expression before parsing. */
-export const MAX_FILTER_TOKENS = 100;
-
-/** Maximum allowed nesting depth for parentheses in filter expressions. */
-export const MAX_FILTER_DEPTH = 10;
-
-/** 0-based character span [start, end) in the original filter input. */
-export interface SourceRange {
-  start: number;
-  end: number;
-}
-
-/** Stable machine-readable error codes for filter expression validation. */
-export type FilterErrorCode =
-  | "FILTER_SYNTAX_ERROR"
-  | "FILTER_UNKNOWN_EVENT"
-  | "FILTER_UNKNOWN_FIELD"
-  | "FILTER_TYPE_MISMATCH"
-  | "FILTER_OPERATOR_NOT_SUPPORTED"
-  | "FILTER_USDC_PRECISION"
-  | "FILTER_TOKEN_LIMIT"
-  | "FILTER_DEPTH_LIMIT";
-
-function boundedTokenLabel(text: string, maxLen = 32): string {
-  if (text.length <= maxLen) return text;
-  return `${text.slice(0, maxLen - 1)}…`;
-}
-
-/** Error thrown when a filter expression exceeds the maximum allowed token count. */
-export class FilterTokenLimitError extends Error {
-  public readonly code = "FILTER_TOKEN_LIMIT" as const;
-  public readonly count: number;
-  public readonly limit: number;
-  public readonly range: SourceRange;
-
-  constructor(
-    count: number,
-    limit: number = MAX_FILTER_TOKENS,
-    range: SourceRange = { start: 0, end: 0 },
-  ) {
-    super(`Filter expression exceeds maximum token limit of ${limit} (got ${count})`);
-    this.name = "FilterTokenLimitError";
-    this.count = count;
-    this.limit = limit;
-    this.range = range;
+/**
+ * Canonicalizes a schema (either a single event schema or a full registry)
+ * into a normalized structure.
+ */
+export function normalizeSchema(
+  schema: Record<string, FieldDefinition> | Record<string, Record<string, FieldDefinition>>,
+): NormalizedEventSchema | NormalizedSchemaRegistry {
+  const entries = Object.entries(schema);
+  if (entries.length === 0) {
+    return {};
   }
-}
-
-/** Error thrown when a filter expression exceeds the maximum allowed nesting depth. */
-export class FilterDepthLimitError extends Error {
-  public readonly code = "FILTER_DEPTH_LIMIT" as const;
-  public readonly depth: number;
-  public readonly limit: number;
-  public readonly position: number;
-  public readonly range: SourceRange;
-
-  constructor(depth: number, limit: number = MAX_FILTER_DEPTH, position = 0) {
-    super(`At character ${position}: Filter expression exceeds maximum nesting depth of ${limit} (depth ${depth})`);
-    this.name = "FilterDepthLimitError";
-    this.depth = depth;
-    this.limit = limit;
-    this.position = position;
-    this.range = { start: position, end: position + 1 };
+  const firstVal = entries[0]?.[1];
+  if (firstVal && typeof firstVal === "object" && "type" in firstVal) {
+    return normalizeEventSchema(schema as Record<string, FieldDefinition>);
   }
+  return normalizeSchemaRegistry(schema as Record<string, Record<string, FieldDefinition>>);
 }
 
-/** Parse / Validation Error with character position, source range, and machine-readable code. */
+/**
+ * Deterministically serializes a schema and its version to a JSON string.
+ */
+export function canonicalizeSchema(
+  schema: Record<string, FieldDefinition> | Record<string, Record<string, FieldDefinition>>,
+  version: number = FILTER_SCHEMA_VERSION,
+): string {
+  const normalizedVersion = normalizeSchemaVersion(version);
+  const normalized = normalizeSchema(schema);
+  return JSON.stringify({
+    schema: normalized,
+    version: normalizedVersion,
+  });
+}
+
+/**
+ * Computes a SHA-256 hex digest of a normalized schema and its version.
+ */
+export function computeSchemaDigest(
+  schema: Record<string, FieldDefinition> | Record<string, Record<string, FieldDefinition>>,
+  version: number = FILTER_SCHEMA_VERSION,
+): string {
+  const canonical = canonicalizeSchema(schema, version);
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Computes the normalized schema digest for a specific event within a registry.
+ */
+export function getEventSchemaDigest(
+  eventName: string,
+  schemas: Record<string, Record<string, FieldDefinition>> = EVENT_PAYLOAD_SCHEMAS,
+  version: number = FILTER_SCHEMA_VERSION,
+): string {
+  const eventSchema = schemas[eventName];
+  if (!eventSchema) {
+    throw new Error(`Unknown event schema "${eventName}"`);
+  }
+  const normalizedVersion = normalizeSchemaVersion(version);
+  const normalized = normalizeEventSchema(eventSchema);
+  const canonical = JSON.stringify({
+    eventName,
+    schema: normalized,
+    version: normalizedVersion,
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Computes the normalized schema digest for the entire schema registry.
+ */
+export function getSchemaDigest(
+  schemas: Record<string, Record<string, FieldDefinition>> = EVENT_PAYLOAD_SCHEMAS,
+  version: number = FILTER_SCHEMA_VERSION,
+): string {
+  return computeSchemaDigest(schemas, version);
+}
+
+/** Parse / Validation Error with character position. */
 export class FilterParseError extends Error {
   public readonly position: number;
   public readonly range: SourceRange;
@@ -317,6 +383,40 @@ export interface FilterRule {
   eventNameEnd?: number;
   condition?: ExprNode;
   rawExpression: string;
+  /** Schema version at compilation time. */
+  schemaVersion?: number;
+  /** SHA-256 fingerprint digest of the normalized schema. */
+  digest?: string;
+  /** Alias to digest. */
+  schemaDigest?: string;
+  /** Alias to digest. */
+  fingerprint?: string;
+  /** Event-specific schema digest if eventName is present. */
+  eventDigest?: string;
+  /** Registry-wide schema digest. */
+  registryDigest?: string;
+}
+
+/**
+ * A compiled, versioned, and fingerprinted notification filter rule.
+ */
+export interface CompiledFilterRule extends FilterRule {
+  schemaVersion: number;
+  digest: string;
+  schemaDigest: string;
+  fingerprint: string;
+  evaluate: (event: DecodedEvent) => boolean;
+  isStale: (
+    schemas?: Record<string, Record<string, FieldDefinition>>,
+    currentVersion?: number | string,
+  ) => boolean;
+}
+
+export interface CompileFilterOptions {
+  /** Target schema version to compile against. Defaults to FILTER_SCHEMA_VERSION (1). */
+  schemaVersion?: number | string;
+  /** Schema registry to validate against and fingerprint. Defaults to EVENT_PAYLOAD_SCHEMAS. */
+  schemas?: Record<string, Record<string, FieldDefinition>>;
 }
 
 // ----------------------------------------------------
@@ -624,20 +724,15 @@ export function countFilterTokens(input: string, maxTokens: number = MAX_FILTER_
 export class FilterParser {
   private lexer: Lexer;
   private currentToken: Token;
-  private tokenCount = 0;
-  private currentDepth = 0;
-  private readonly maxTokens: number;
-  private readonly maxDepth: number;
+  private schemas: Record<string, Record<string, FieldDefinition>>;
 
-  constructor(input: string, options?: FilterParserOptions) {
-    this.maxTokens = options?.maxTokens ?? MAX_FILTER_TOKENS;
-    this.maxDepth = options?.maxDepth ?? MAX_FILTER_DEPTH;
-
-    // Bound token count upfront to reject excessive tokens and avoid deep recursion/allocation spikes
-    countFilterTokens(input, this.maxTokens);
-
+  constructor(
+    input: string,
+    schemas: Record<string, Record<string, FieldDefinition>> = EVENT_PAYLOAD_SCHEMAS,
+  ) {
     this.lexer = new Lexer(input);
-    this.currentToken = this.advance();
+    this.currentToken = this.lexer.nextToken();
+    this.schemas = schemas;
   }
 
   private advance(): Token {
@@ -667,13 +762,8 @@ export class FilterParser {
       this.advance();
 
       // Check if event name is known if schemas are defined
-      if (EVENT_PAYLOAD_SCHEMAS && !(eventName in EVENT_PAYLOAD_SCHEMAS)) {
-        throw new FilterParseError(
-          `Unknown event name "${boundedTokenLabel(eventName)}"`,
-          eventNamePos,
-          eventNameEnd,
-          "FILTER_UNKNOWN_EVENT",
-        );
+      if (this.schemas && !(eventName in this.schemas)) {
+        throw new FilterParseError(`Unknown event name "${eventName}"`, eventNamePos);
       }
     }
 
@@ -706,9 +796,9 @@ export class FilterParser {
       );
     }
 
-    // Validate fields and unit compatibility against schema
-    if (condition) {
-      validateConditionAgainstSchema(condition, eventName);
+    // Validate fields against schema if eventName is specified
+    if (condition && eventName) {
+      validateConditionAgainstSchema(condition, eventName, this.schemas);
     }
 
     return {
@@ -851,26 +941,15 @@ export class FilterParser {
   }
 }
 
-/** Validate a single comparison node against its resolved FieldDefinition. */
-function validateComparisonField(
-  node: Extract<ExprNode, { type: "comparison" }>,
-  fieldDef: FieldDefinition,
+/** Validate fields and types in condition against the given event payload schema. */
+export function validateConditionAgainstSchema(
+  condition: ExprNode,
+  eventName: string,
+  schemas: Record<string, Record<string, FieldDefinition>> = EVENT_PAYLOAD_SCHEMAS,
 ): void {
-  switch (fieldDef.type) {
-    case "string":
-      if (node.value.kind !== "string") {
-        throw new FilterParseError(
-          `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
-          node.valuePos,
-        );
-      }
-      if (node.op !== "==" && node.op !== "!=") {
-        throw new FilterParseError(
-          `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
-          node.fieldPos,
-        );
-      }
-      break;
+  const schema = schemas[eventName];
+  if (!schema) return;
+  const currentSchema = schema;
 
     case "boolean":
       if (node.value.kind !== "boolean") {
@@ -1033,13 +1112,209 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName?: 
 }
 
 // ----------------------------------------------------
+// Compilation & Staleness Detection
+// ----------------------------------------------------
+
+/**
+ * Compiles a parsed {@link FilterRule} by attaching normalized schema version
+ * and SHA-256 fingerprint digest metadata, along with evaluate and staleness check helpers.
+ *
+ * @param rule The parsed filter rule.
+ * @param options Compilation options (target schema version and schemas registry).
+ * @returns A {@link CompiledFilterRule} carrying version, digest, and helper methods.
+ */
+export function compileFilterRule(
+  rule: FilterRule,
+  options: CompileFilterOptions = {},
+): CompiledFilterRule {
+  const schemas = options.schemas ?? EVENT_PAYLOAD_SCHEMAS;
+  const version = normalizeSchemaVersion(options.schemaVersion ?? FILTER_SCHEMA_VERSION);
+
+  // Validate eventName if provided
+  if (rule.eventName && !(rule.eventName in schemas)) {
+    throw new FilterParseError(
+      `Unknown event name "${rule.eventName}"`,
+      rule.eventNamePos ?? 0,
+    );
+  }
+
+  // Validate condition against schema if eventName is specified
+  if (rule.condition && rule.eventName) {
+    validateConditionAgainstSchema(rule.condition, rule.eventName, schemas);
+  }
+
+  // Compute digests
+  const registryDigest = getSchemaDigest(schemas, version);
+  let eventDigest: string | undefined;
+  let primaryDigest: string;
+
+  if (rule.eventName) {
+    eventDigest = getEventSchemaDigest(rule.eventName, schemas, version);
+    primaryDigest = eventDigest;
+  } else {
+    primaryDigest = registryDigest;
+  }
+
+  const compiled: CompiledFilterRule = {
+    ...rule,
+    schemaVersion: version,
+    digest: primaryDigest,
+    schemaDigest: primaryDigest,
+    fingerprint: primaryDigest,
+    eventDigest,
+    registryDigest,
+    evaluate: (event: DecodedEvent) => evaluateFilterRule(compiled, event),
+    isStale: (
+      currentSchemas = EVENT_PAYLOAD_SCHEMAS,
+      currentVersion = FILTER_SCHEMA_VERSION,
+    ) => isFilterRuleStale(compiled, currentSchemas, currentVersion),
+  };
+
+  return compiled;
+}
+
+/**
+ * Parses and compiles a filter expression string into a {@link CompiledFilterRule}
+ * with attached schema version and digest.
+ *
+ * @throws {@link FilterParseError} on invalid syntax, unknown fields, or type mismatches.
+ */
+export function compileFilterExpression(
+  input: string,
+  options: CompileFilterOptions = {},
+): CompiledFilterRule {
+  const schemas = options.schemas ?? EVENT_PAYLOAD_SCHEMAS;
+  const parser = new FilterParser(input.trim(), schemas);
+  const parsed = parser.parseRule(input);
+  return compileFilterRule(parsed, options);
+}
+
+/**
+ * Convenience function to compile either a raw expression string or an existing {@link FilterRule}.
+ */
+export function compileFilter(
+  inputOrRule: string | FilterRule,
+  options: CompileFilterOptions = {},
+): CompiledFilterRule {
+  if (typeof inputOrRule === "string") {
+    return compileFilterExpression(inputOrRule, options);
+  }
+  return compileFilterRule(inputOrRule, options);
+}
+
+/**
+ * Result of a staleness check on a compiled filter rule.
+ */
+export interface StalenessCheckResult {
+  stale: boolean;
+  reason?:
+    | "UNCOMPILED_RULE"
+    | "VERSION_MISMATCH"
+    | "UNKNOWN_EVENT"
+    | "SCHEMA_DIGEST_MISMATCH"
+    | "CONDITION_VALIDATION_FAILED";
+  details?: string;
+}
+
+/**
+ * Checks whether a compiled filter rule is stale relative to current event schemas
+ * or a bumped schema version.
+ */
+export function checkFilterStaleness(
+  rule: FilterRule,
+  schemas: Record<string, Record<string, FieldDefinition>> = EVENT_PAYLOAD_SCHEMAS,
+  currentVersion: number | string = FILTER_SCHEMA_VERSION,
+): StalenessCheckResult {
+  const expectedVersion = normalizeSchemaVersion(currentVersion);
+
+  if (
+    rule.schemaVersion === undefined ||
+    (!rule.digest && !rule.schemaDigest && !rule.fingerprint)
+  ) {
+    return {
+      stale: true,
+      reason: "UNCOMPILED_RULE",
+      details: "Rule does not carry schemaVersion and digest metadata",
+    };
+  }
+
+  if (rule.schemaVersion !== expectedVersion) {
+    return {
+      stale: true,
+      reason: "VERSION_MISMATCH",
+      details: `Rule schema version ${rule.schemaVersion} does not match current version ${expectedVersion}`,
+    };
+  }
+
+  const ruleDigest = rule.digest ?? rule.schemaDigest ?? rule.fingerprint;
+
+  if (rule.eventName) {
+    if (!(rule.eventName in schemas)) {
+      return {
+        stale: true,
+        reason: "UNKNOWN_EVENT",
+        details: `Event "${rule.eventName}" is no longer in current schemas`,
+      };
+    }
+
+    const currentEventDigest = getEventSchemaDigest(rule.eventName, schemas, expectedVersion);
+    const currentRegistryDigest = getSchemaDigest(schemas, expectedVersion);
+
+    if (ruleDigest !== currentEventDigest && ruleDigest !== currentRegistryDigest) {
+      return {
+        stale: true,
+        reason: "SCHEMA_DIGEST_MISMATCH",
+        details: `Schema digest mismatch for event "${rule.eventName}"`,
+      };
+    }
+
+    if (rule.condition) {
+      try {
+        validateConditionAgainstSchema(rule.condition, rule.eventName, schemas);
+      } catch (err) {
+        return {
+          stale: true,
+          reason: "CONDITION_VALIDATION_FAILED",
+          details: (err as Error).message,
+        };
+      }
+    }
+  } else {
+    const currentRegistryDigest = getSchemaDigest(schemas, expectedVersion);
+    if (ruleDigest !== currentRegistryDigest) {
+      return {
+        stale: true,
+        reason: "SCHEMA_DIGEST_MISMATCH",
+        details: "Global schema registry digest mismatch",
+      };
+    }
+  }
+
+  return { stale: false };
+}
+
+/**
+ * Returns true if a compiled filter rule has become stale due to schema changes or version bumps.
+ */
+export function isFilterRuleStale(
+  rule: FilterRule,
+  schemas: Record<string, Record<string, FieldDefinition>> = EVENT_PAYLOAD_SCHEMAS,
+  currentVersion: number | string = FILTER_SCHEMA_VERSION,
+): boolean {
+  return checkFilterStaleness(rule, schemas, currentVersion).stale;
+}
+
+/** Alias to {@link isFilterRuleStale}. */
+export const isCompiledFilterStale = isFilterRuleStale;
+
+// ----------------------------------------------------
 // Public parse function
 // ----------------------------------------------------
 
 /**
- * Parses a filter expression string into a structured {@link FilterRule}.
- * Bounds token count and nesting depth upfront to prevent allocation spikes
- * or deep recursion on hostile input.
+ * Parses a filter expression string into a structured, compiled {@link CompiledFilterRule}.
+ * Returns a rule that is fully compatible with {@link FilterRule} while carrying
+ * schemaVersion, digest, and evaluation helpers.
  *
  * @param input The raw filter expression string.
  * @param options Optional limits on tokens ({@link MAX_FILTER_TOKENS}) and depth ({@link MAX_FILTER_DEPTH}).
@@ -1047,9 +1322,11 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName?: 
  * @throws {@link FilterDepthLimitError} if parentheses nesting depth exceeds maxDepth.
  * @throws {@link FilterParseError} on invalid syntax, unknown fields, or type mismatches.
  */
-export function parseFilterExpression(input: string, options?: FilterParserOptions): FilterRule {
-  const parser = new FilterParser(input, options);
-  return parser.parseRule(input);
+export function parseFilterExpression(
+  input: string,
+  options: CompileFilterOptions = {},
+): CompiledFilterRule {
+  return compileFilterExpression(input, options);
 }
 
 // ----------------------------------------------------

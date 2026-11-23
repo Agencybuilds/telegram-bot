@@ -11,16 +11,11 @@
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
-import type { SourceRange } from "./filter-expr.js";
-
-/** Stable machine-readable error codes for USDC threshold validation. */
-export type InvalidThresholdCode =
-  | "THRESHOLD_NOT_STRING"
-  | "THRESHOLD_EMPTY"
-  | "THRESHOLD_NEGATIVE"
-  | "THRESHOLD_LEADING_PLUS"
-  | "THRESHOLD_MALFORMED"
-  | "THRESHOLD_PRECISION_EXCEEDED";
+import {
+  compileFilterExpression,
+  type CompiledFilterRule,
+  type CompileFilterOptions,
+} from "./filter-expr.js";
 
 /** Error thrown when a threshold string is negative, malformed, or invalid. */
 export class InvalidThresholdError extends Error {
@@ -244,4 +239,52 @@ export function meetsThreshold(
   thresholds?: AmountThresholds,
 ): boolean {
   return evaluateThresholdDiagnostic(event, thresholds).passed;
+}
+
+/**
+ * Compiles configured amount thresholds into equivalent versioned, fingerprinted
+ * {@link CompiledFilterRule} filters.
+ *
+ * - `marketChallenge` becomes `claim_challenged where stake >= <threshold>`
+ * - `squadDeposit` becomes `deposited where amount >= <threshold>`
+ *
+ * Returns an array of compiled filter rules with attached schema versions and digests.
+ */
+export function compileAmountThresholdFilters(
+  thresholds?: AmountThresholds,
+  options?: CompileFilterOptions,
+): CompiledFilterRule[] {
+  if (!thresholds) {
+    return [];
+  }
+  const rules: CompiledFilterRule[] = [];
+  if (thresholds.marketChallenge !== undefined && thresholds.marketChallenge > 0n) {
+    const whole = thresholds.marketChallenge / 10_000_000n;
+    const frac = thresholds.marketChallenge % 10_000_000n;
+    const decimalStr =
+      frac === 0n
+        ? `${whole}`
+        : `${whole}.${frac.toString().padStart(7, "0").replace(/0+$/, "")}`;
+    rules.push(
+      compileFilterExpression(
+        `claim_challenged where stake >= ${decimalStr} USDC`,
+        options,
+      ),
+    );
+  }
+  if (thresholds.squadDeposit !== undefined && thresholds.squadDeposit > 0n) {
+    const whole = thresholds.squadDeposit / 10_000_000n;
+    const frac = thresholds.squadDeposit % 10_000_000n;
+    const decimalStr =
+      frac === 0n
+        ? `${whole}`
+        : `${whole}.${frac.toString().padStart(7, "0").replace(/0+$/, "")}`;
+    rules.push(
+      compileFilterExpression(
+        `deposited where amount >= ${decimalStr} USDC`,
+        options,
+      ),
+    );
+  }
+  return rules;
 }
