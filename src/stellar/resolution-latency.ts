@@ -2,6 +2,22 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey, type DedupableEvent } from "../dedup.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  computeCaptureCompleteness,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+} from "./capture-completeness.js";
+
+export {
+  assertCompleteCapture,
+  computeCaptureCompleteness,
+  IncompleteCaptureError,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+  type CaptureGap,
+  type CaptureGapInput,
+  type LedgerRange,
+} from "./capture-completeness.js";
 
 export const RESOLUTION_LATENCY_CHECKPOINT_FORMAT = "mimir-resolution-latency-checkpoint-v1";
 export const RESOLUTION_LATENCY_CHECKPOINT_VERSION = 1;
@@ -72,14 +88,16 @@ export interface ResolutionLatencyOptions {
   includeCheckpoint?: boolean;
 }
 
+export interface ResolutionLatencyOptions extends CaptureCompletenessOptions {}
+
 export interface ResolutionLatencyReport {
   resolved: LatencyGroup;
   cancelled: LatencyGroup;
   excludedCount: number;
-  /** Optional versioned bounded checkpoint state representing this latency tracker, resumable for future pages. */
-  checkpoint?: ResolutionLatencyCheckpoint;
-  /** Events skipped because they were already accounted for in a resumed checkpoint or earlier page. */
-  resumedDuplicates?: number;
+  /** Capture completeness metadata including ledger range and gap information. */
+  completeness: CaptureCompleteness;
+  /** Alias for completeness metadata. */
+  capture: CaptureCompleteness;
 }
 
 export class ResolutionLatencyCheckpointError extends Error {
@@ -487,6 +505,7 @@ export class ResolutionLatencyReducer {
  * Excludes claims missing either creation or resolution/cancellation event.
  * If multiple creation or resolution events exist for the same claimId, deterministic
  * earliest creation and earliest resolution/cancellation are used.
+ * Annotates results with capture completeness metadata (ledger range and gaps).
  *
  * If a `checkpoint` is passed via `options`, reduces incrementally starting from the
  * checkpoint state and drops overlapping replay events seen in `recentEventIds`.
@@ -494,12 +513,144 @@ export class ResolutionLatencyReducer {
  * Uses integer math only.
  */
 export function resolutionLatency(
-  events: readonly DecodedEvent[],
+  events: readonly DecodedEvent[] | null | undefined,
   options?: ResolutionLatencyOptions,
 ): ResolutionLatencyReport {
-  const reducer = new ResolutionLatencyReducer(options);
-  if (events && Array.isArray(events)) {
-    reducer.addEvents(events);
+  const completeness = computeCaptureCompleteness(events, options);
+
+  if (!events || !Array.isArray(events) || events.length === 0) {
+    return {
+      resolved: { claims: [], summary: null },
+      cancelled: { claims: [], summary: null },
+      excludedCount: 0,
+      completeness,
+      capture: completeness,
+    };
   }
-  return reducer.toReport({ includeCheckpoint: options?.includeCheckpoint });
+
+  const creations = new Map<number, { at: number; ledger: number }>();
+  const resolutions = new Map<number, { at: number; ledger: number }>();
+  const cancellations = new Map<number, { at: number; ledger: number }>();
+
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const payload = event.payload;
+    if (!payload || !("name" in payload) || !("claimId" in payload)) {
+      continue;
+    }
+
+    const claimId = payload.claimId;
+    if (typeof claimId !== "number" || !Number.isFinite(claimId)) {
+      continue;
+    }
+
+    if (payload.name === "claim_created") {
+      const existing = creations.get(claimId);
+      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
+        creations.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      }
+    } else if (payload.name === "claim_resolved") {
+      const existing = resolutions.get(claimId);
+      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
+        resolutions.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      }
+    } else if (payload.name === "claim_cancelled") {
+      const existing = cancellations.get(claimId);
+      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
+        cancellations.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      }
+    }
+  }
+
+  // All known claimIds across any event type
+  const allClaimIds = new Set<number>([
+    ...creations.keys(),
+    ...resolutions.keys(),
+    ...cancellations.keys(),
+  ]);
+
+  const resolvedClaims: ClaimLatency[] = [];
+  const cancelledClaims: ClaimLatency[] = [];
+  let excludedCount = 0;
+
+  for (const claimId of allClaimIds) {
+    const creation = creations.get(claimId);
+    const resolution = resolutions.get(claimId);
+    const cancellation = cancellations.get(claimId);
+
+    // If missing creation, it cannot form a duration
+    if (!creation) {
+      excludedCount++;
+      continue;
+    }
+
+    // A claim may have resolution or cancellation or neither
+    // If both exist (rare/edge case), pick the one with earlier ledger/at
+    let endEvent: { at: number; ledger: number } | null = null;
+    let endType: "resolved" | "cancelled" | null = null;
+
+    if (resolution && cancellation) {
+      if (
+        resolution.ledger < cancellation.ledger ||
+        (resolution.ledger === cancellation.ledger && resolution.at <= cancellation.at)
+      ) {
+        endEvent = resolution;
+        endType = "resolved";
+      } else {
+        endEvent = cancellation;
+        endType = "cancelled";
+      }
+    } else if (resolution) {
+      endEvent = resolution;
+      endType = "resolved";
+    } else if (cancellation) {
+      endEvent = cancellation;
+      endType = "cancelled";
+    }
+
+    if (!endEvent || !endType) {
+      // Incomplete claim (missing end)
+      excludedCount++;
+      continue;
+    }
+
+    const durationSec = Math.max(0, Math.trunc(endEvent.at - creation.at));
+    const durationLedgers = Math.max(0, Math.trunc(endEvent.ledger - creation.ledger));
+
+    const claimLatency: ClaimLatency = {
+      claimId,
+      creationLedger: creation.ledger,
+      creationAt: creation.at,
+      resolutionLedger: endEvent.ledger,
+      resolutionAt: endEvent.at,
+      duration: {
+        seconds: durationSec,
+        ledgers: durationLedgers,
+      },
+    };
+
+    if (endType === "resolved") {
+      resolvedClaims.push(claimLatency);
+    } else {
+      cancelledClaims.push(claimLatency);
+    }
+  }
+
+  // Ensure deterministic ordering by claimId ascending
+  resolvedClaims.sort((a, b) => a.claimId - b.claimId);
+  cancelledClaims.sort((a, b) => a.claimId - b.claimId);
+
+  return {
+    resolved: {
+      claims: resolvedClaims,
+      summary: computeSummary(resolvedClaims),
+    },
+    cancelled: {
+      claims: cancelledClaims,
+      summary: computeSummary(cancelledClaims),
+    },
+    excludedCount,
+    completeness,
+    capture: completeness,
+  };
 }

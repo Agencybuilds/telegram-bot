@@ -2,11 +2,28 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey, type DedupableEvent } from "../dedup.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  computeCaptureCompleteness,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+} from "./capture-completeness.js";
+
+export {
+  assertCompleteCapture,
+  computeCaptureCompleteness,
+  IncompleteCaptureError,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+  type CaptureGap,
+  type CaptureGapInput,
+  type LedgerRange,
+} from "./capture-completeness.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
-export const VOLUME_SERIES_CHECKPOINT_FORMAT = "mimir-volume-series-checkpoint-v1";
-export const VOLUME_SERIES_CHECKPOINT_VERSION = 1;
+export interface VolumeSeriesOptions extends CaptureCompletenessOptions {
+  bucket: VolumeBucketUnit;
+}
 
 export interface VolumeBucketCheckpointState {
   startAt: number;
@@ -17,81 +34,30 @@ export interface VolumeBucketCheckpointState {
   eventCount: number;
 }
 
-/**
- * Versioned, bounded checkpoint state for volume series reducers.
- *
- * Persists intermediate bucket sums and a bounded deduplication window of recent
- * event identifiers to prevent double-counting when resuming across overlapping
- * pagination boundaries (e.g. inclusive Soroban `getEvents` cursors).
- */
-export interface VolumeSeriesCheckpoint {
-  format: "mimir-volume-series-checkpoint-v1";
-  version: 1;
-  bucket: VolumeBucketUnit;
-  updatedAt: string;
-  processedEvents: number;
-  skippedWithoutAt: number;
-  totalChallengeStake: string;
-  totalSquadDeposit: string;
-  minBucketStart: number | null;
-  maxBucketStart: number | null;
-  buckets: VolumeBucketCheckpointState[];
-  recentEventIds: string[];
-  lastProcessedEventId?: string | null;
-  dedupCapacity: number;
-}
-
-export interface VolumeSeriesOptions {
-  bucket: VolumeBucketUnit;
-  /** Optional versioned checkpoint to resume from. */
-  checkpoint?: VolumeSeriesCheckpoint | null;
-  /** Deduplication window capacity for dropping overlapping events across scan pages (default: 256). */
-  dedupCapacity?: number;
-  /** Whether to drop duplicate event IDs within and across batches. Defaults to true when resuming from a checkpoint. */
-  dedup?: boolean;
-  /** Maximum number of buckets to retain in reducer state (bounded state). */
-  maxBuckets?: number;
-  /** Whether to include the checkpoint and resumedDuplicates in the returned VolumeSeriesResult. */
-  includeCheckpoint?: boolean;
-}
-
-/**
- * Summary of the volume series. Conflicting terminal events are not silently
- * resolved; they are reported via `inconsistencies`.
- */
-
-export interface VolumeBucket {
-  /** UTC ISO string representing the start of the bucket. */
-  timestamp: string;
-  /** Unix timestamp in seconds for the start of the bucket. */
-  startAt: number;
-  /** Composite identity of the aggregate this bucket belongs to. */
-  identityKey: string;
-  challengeStakeTotal: string;
-  squadDepositTotal: string;
-  challengeStake: bigint;
-  squadDeposit: bigint;
-  challengeCount: number;
-  depositCount: number;
-  eventCount: number;
-  /**
-   * True when no valid events fell into this bucket. Zero-filled buckets carry
-   * `empty: true` so consumers can distinguish an absent observation from a
-   * real zero total.
-   */
-  empty: boolean;
-}
-
 export interface VolumeSeriesResult {
+  /** Contiguous time buckets (zero-filled) between earliest and latest event, or empty if no valid events. */
   buckets: VolumeBucket[];
+  /** Total challenge stake across all buckets in this captured series as bigint string. */
   totalChallengeStake: string;
+  /** Total squad deposit across all buckets in this captured series as bigint string. */
   totalSquadDeposit: string;
+  /** Count of events skipped due to missing or invalid `at` timestamp. */
   skippedWithoutAt: number;
+  /** Total valid events processed. */
   processedEvents: number;
-  /** Optional versioned bounded checkpoint state representing this series, resumable for future pages. */
-  checkpoint?: VolumeSeriesCheckpoint;
-  /** Events skipped because they were already accounted for in a resumed checkpoint or earlier page. */
-  resumedDuplicates?: number;
+  /** Capture completeness metadata including ledger range and gap information. */
+  completeness: CaptureCompleteness;
+  /** Alias for completeness metadata. */
+  capture: CaptureCompleteness;
+  /**
+   * Verified global market totals across the entire market lifetime.
+   * Only populated when `completeness.isComplete` is true.
+   * `null` for partial captures to prevent partial captures from being presented as global market totals.
+   */
+  globalMarketTotals: {
+    totalChallengeStake: string;
+    totalSquadDeposit: string;
+  } | null;
 }
 
 const SECONDS_PER_HOUR = 3600;
@@ -229,8 +195,11 @@ interface IntermediateBucket {
 /**
  * Incremental, checkpointable reducer for time-bucketed volume series.
  *
- * Supports page-by-page feeding during long-running scans with a bounded
- * deduplication window so overlapping replay pages do not double-count events.
+ * Empty buckets between earliest and latest events are filled with zero values.
+ * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
+ * Annotates results with capture completeness metadata (ledger range and gaps).
+ * Partial captures keep `globalMarketTotals: null` to prevent presenting partial captures
+ * as global market totals.
  */
 export class VolumeSeriesReducer {
   readonly bucketUnit: VolumeBucketUnit;
@@ -269,17 +238,10 @@ export class VolumeSeriesReducer {
     }
   }
 
-  private restoreCheckpoint(cp: VolumeSeriesCheckpoint): void {
-    if (cp.format !== VOLUME_SERIES_CHECKPOINT_FORMAT || cp.version !== VOLUME_SERIES_CHECKPOINT_VERSION) {
-      throw new VolumeSeriesCheckpointError(
-        `Incompatible volume series checkpoint format or version (expected ${VOLUME_SERIES_CHECKPOINT_FORMAT} v${VOLUME_SERIES_CHECKPOINT_VERSION})`,
-      );
-    }
-    if (cp.bucket !== this.bucketUnit) {
-      throw new VolumeSeriesCheckpointError(
-        `Cannot resume volume series checkpoint: bucket unit mismatch (checkpoint has "${cp.bucket}", options specified "${this.bucketUnit}")`,
-      );
-    }
+  // Derive capture completeness metadata (and enforce requireComplete if requested)
+  const completeness = computeCaptureCompleteness(events, options);
+
+  const stepSeconds = bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
 
     this.minBucketStart = cp.minBucketStart;
     this.maxBucketStart = cp.maxBucketStart;
@@ -324,9 +286,16 @@ export class VolumeSeriesReducer {
 
   get stats(): { processedEvents: number; skippedWithoutAt: number; resumedDuplicates: number } {
     return {
-      processedEvents: this.processedEvents,
-      skippedWithoutAt: this.skippedWithoutAt,
-      resumedDuplicates: this.resumedDuplicates,
+      buckets: [],
+      totalChallengeStake: "0",
+      totalSquadDeposit: "0",
+      skippedWithoutAt: 0,
+      processedEvents: 0,
+      completeness,
+      capture: completeness,
+      globalMarketTotals: completeness.isComplete
+        ? { totalChallengeStake: "0", totalSquadDeposit: "0" }
+        : null,
     };
     attachSeriesMetadata(emptyResult, 0n, 0n);
     return emptyResult;
@@ -462,9 +431,16 @@ export class VolumeSeriesReducer {
     }
 
     return {
-      processed: this.processedEvents - prevProcessed,
-      duplicates: this.resumedDuplicates - prevDuplicates,
-      skippedWithoutAt: this.skippedWithoutAt - prevSkipped,
+      buckets: [],
+      totalChallengeStake: "0",
+      totalSquadDeposit: "0",
+      skippedWithoutAt,
+      processedEvents,
+      completeness,
+      capture: completeness,
+      globalMarketTotals: completeness.isComplete
+        ? { totalChallengeStake: "0", totalSquadDeposit: "0" }
+        : null,
     };
   }
 
@@ -544,36 +520,22 @@ export class VolumeSeriesReducer {
     return baseResult;
   }
 
-  static fromCheckpoint(
-    checkpoint: VolumeSeriesCheckpoint,
-    options?: Partial<VolumeSeriesOptions>,
-  ): VolumeSeriesReducer {
-    return new VolumeSeriesReducer({
-      bucket: options?.bucket ?? checkpoint.bucket,
-      checkpoint,
-      dedupCapacity: options?.dedupCapacity ?? checkpoint.dedupCapacity,
-      maxBuckets: options?.maxBuckets,
-      includeCheckpoint: options?.includeCheckpoint,
-    });
-  }
-}
+  const totalChallengeStakeStr = totalChallengeStakeBigInt.toString();
+  const totalSquadDepositStr = totalSquadDepositBigInt.toString();
 
-/**
- * Produce time-bucketed volume series for stakes and deposits.
- *
- * Empty buckets between earliest and latest events are filled with zero values.
- * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
- *
- * If a `checkpoint` is passed via `options`, reduces incrementally starting from the
- * checkpoint state and drops overlapping replay events seen in `recentEventIds`.
- */
-export function volumeSeries(
-  events: readonly DecodedEvent[] | null | undefined,
-  options: VolumeSeriesOptions,
-): VolumeSeriesResult {
-  const reducer = new VolumeSeriesReducer(options);
-  if (events && Array.isArray(events)) {
-    reducer.addEvents(events);
-  }
-  return reducer.toResult({ includeCheckpoint: options?.includeCheckpoint });
+  return {
+    buckets,
+    totalChallengeStake: totalChallengeStakeStr,
+    totalSquadDeposit: totalSquadDepositStr,
+    skippedWithoutAt,
+    processedEvents,
+    completeness,
+    capture: completeness,
+    globalMarketTotals: completeness.isComplete
+      ? {
+          totalChallengeStake: totalChallengeStakeStr,
+          totalSquadDeposit: totalSquadDepositStr,
+        }
+      : null,
+  };
 }
