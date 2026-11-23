@@ -1571,8 +1571,8 @@ async function sendWithRetry(
     } catch (err) {
       attempt++;
       const retryAfterMs = extractRetryAfterMs(err);
-      if (attempt >= maxRetries || !shouldRetry()) {
-        throw err; // Exhausted retries, or a shutdown made waiting pointless
+      if (attempt >= maxRetries || !shouldRetry() || isForumTopicClosed(err)) {
+        throw err; // Exhausted retries, shutdown in progress, or a permanent route failure
       }
 
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
@@ -2593,7 +2593,18 @@ export function createPoller(deps: PollerDeps) {
             `${chat ? ` to chat ${chat}` : ""} after retries: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
         );
-        if (deadLetterEnabled) {
+        if (isForumTopicClosed(err)) {
+          // Permanent route failure: the topic is closed or deleted. Retrying
+          // will produce the same 400, so the message is not parked in the DLQ.
+          // The cursor still advances and the failure is counted above. The
+          // operator must re-open the topic (or update the route) to restore
+          // delivery; unrelated topic routes remain operational.
+          console.error(
+            `[poller] permanent route failure for ${event.payload.name} at ledger ${event.ledger}` +
+              `${chat ? ` to chat ${chat}` : ""}: forum topic is closed or not found — ` +
+              `not queuing for retry (update the route to restore delivery)`,
+          );
+        } else if (deadLetterEnabled) {
           await deadLetter.enqueue({
             source: event.source,
             ledger: event.ledger,
