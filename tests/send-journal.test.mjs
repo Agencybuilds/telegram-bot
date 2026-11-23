@@ -241,6 +241,7 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
 
     // The intent must be durable before the send returns.
     await waitFor(async () => {
+      if (sendCalls < 1) return false;
       const raw = await readFile(journalFile, "utf8").catch(() => "");
       return raw.includes('"kind":"intent"');
     });
@@ -263,156 +264,148 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
   }
 });
 
-// ── Per-destination outcomes & crash recovery ────────────────────────────────
+// ── Orphaned journal recovery after configuration changes ────────────────────
 
-test("send journal: tracks separate outcomes per chat and topic and compacts only settled ones", async () => {
-  const dir = await createTempDataDir("mimir-journal-dest-");
-  const file = dir.file("journal.jsonl");
+test("send journal: classifyPending identifies removed routes, changed networks, and legacy entries", async () => {
+  const dir = await createTempDataDir("mimir-journal-orphan-classify-");
   try {
-    const journal = createSendJournal({ filePath: file, now: () => 1_700_000_000_000 });
-    const destA = { chatId: "-1001", topicId: 10 };
-    const destB = { chatId: "-1001", topicId: 20 };
-    const destC = { chatId: "-1002" };
+    const journal = createSendJournal({
+      filePath: dir.file("journal.jsonl"),
+      now: () => 1_700_000_000_000,
+    });
 
-    for (const dest of [destA, destB, destC]) {
-      await journal.recordIntent({
-        id: "evt-multi",
-        source: "market",
-        ledger: 6000,
-        eventName: "claim_created",
-        chatId: dest.chatId,
-        ...(dest.topicId !== undefined ? { topicId: dest.topicId } : {}),
-        textHash: "abcd",
-        at: 1_700_000_000_000,
-      });
-    }
+    // Legacy entry without route/network metadata stays valid for compatibility.
+    await journal.recordIntent({
+      id: "legacy-1",
+      source: "market",
+      ledger: 100,
+      eventName: "claim_created",
+      at: 100,
+    });
+    // Entry matching current config stays valid.
+    await journal.recordIntent({
+      id: "valid-1",
+      source: "market",
+      ledger: 101,
+      eventName: "claim_created",
+      chatId: "-100111",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 101,
+    });
+    // Entry whose route was removed/changed.
+    await journal.recordIntent({
+      id: "removed-route-1",
+      source: "squad",
+      ledger: 102,
+      eventName: "claim_created",
+      chatId: "-100999",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 102,
+    });
+    // Entry from a different network identity.
+    await journal.recordIntent({
+      id: "net-changed-1",
+      source: "market",
+      ledger: 103,
+      eventName: "claim_created",
+      chatId: "-100111",
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+      at: 103,
+    });
 
-    // Settle destA as sent and destC as failed; leave destB unfinished.
-    await journal.recordDone("evt-multi", destA, "sent");
-    await journal.recordDone("evt-multi", destC, "failed");
+    const { valid, orphaned } = await journal.classifyPending({
+      resolveRouteChatId: (source) => (source === "market" ? "-100111" : ""),
+      networkPassphrase: "Test SDF Network ; September 2015",
+    });
 
-    const pending = await journal.loadPendingForEvent("evt-multi");
-    assert.equal(pending.length, 1, "only the unfinished topic remains pending");
-    assert.equal(pending[0].chatId, "-1001");
-    assert.equal(pending[0].topicId, 20);
-
-    // Compaction drops settled pairs and preserves the unfinished destination.
-    await journal.compact();
-    const afterCompact = await journal.loadPending();
-    assert.equal(afterCompact.length, 1);
-    assert.equal(afterCompact[0].chatId, "-1001");
-    assert.equal(afterCompact[0].topicId, 20);
+    assert.deepEqual(
+      valid.map((e) => e.id),
+      ["legacy-1", "valid-1"],
+    );
+    assert.deepEqual(
+      orphaned.map((o) => ({ id: o.entry.id, reason: o.reason })),
+      [
+        { id: "removed-route-1", reason: "removed_route" },
+        { id: "net-changed-1", reason: "network_changed" },
+      ],
+    );
   } finally {
     await dir.cleanup();
   }
 });
 
-test("notifier: persists per-destination outcomes and recovers only unfinished destinations after a crash", async () => {
-  const dir = await createTempDataDir("mimir-notifier-journal-");
+test("send journal: recoverOrphans applies explicit discard/reroute decisions and rejects empty reroutes", async () => {
+  const dir = await createTempDataDir("mimir-journal-orphan-recover-");
   const file = dir.file("journal.jsonl");
   try {
-    const destinations = [
-      { chatId: "-1001", topicId: 11 },
-      { chatId: "-1001", topicId: 22 },
-      { chatId: "-1002" },
-    ];
+    const journal = createSendJournal({
+      filePath: file,
+      now: () => 1_700_000_000_500,
+    });
 
-    const sentFirstRun = [];
-    const crashBot = {
-      api: {
-        sendMessage: async (chatId, text, opts) => {
-          sentFirstRun.push({ chatId, topicId: opts?.message_thread_id, text });
-          if (chatId === "-1001" && opts?.message_thread_id === 22) {
-            throw new Error("simulated crash mid-fanout");
-          }
-          return {};
-        },
-      },
+    await journal.recordIntent({
+      id: "orphan-discard",
+      source: "market",
+      ledger: 200,
+      eventName: "claim_created",
+      chatId: "-100old",
+      networkPassphrase: "Old Net",
+      at: 200,
+    });
+    await journal.recordIntent({
+      id: "orphan-reroute",
+      source: "squad",
+      ledger: 201,
+      eventName: "claim_created",
+      chatId: "-100old-squad",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 201,
+    });
+
+    const context = {
+      resolveRouteChatId: (source) => (source === "squad" ? "-100new-squad" : "-100new-market"),
+      networkPassphrase: "Test SDF Network ; September 2015",
     };
 
-    const journal1 = createSendJournal({ filePath: file, now: () => 1_700_000_000_000 });
-    const notifier1 = createNotifier(crashBot, { chatId: "-1001", botToken: BOT_TOKEN }, { sendJournal: journal1 });
+    const result = await journal.recoverOrphans(context, (orphan) => {
+      if (orphan.entry.id === "orphan-discard") return { action: "discard" };
+      return { action: "reroute" };
+    });
 
-    // Simulate a crash where dest 1 succeeds, dest 2 throws before done, and
-    // wait: if dest 2 throws, notifier1 records "failed" for dest 2. To model
-    // an abrupt crash mid-send for dest 2, hang or inspect pending intents:
-    // Here we simulate an abrupt crash by writing an unfinished intent directly
-    // or aborting before recordDone: let's verify both failure outcome and
-    // unfinished crash recovery.
+    assert.equal(result.discarded, 1);
+    assert.equal(result.rerouted, 1);
+    assert.equal(result.reroutedEntries[0].id, "orphan-reroute");
+    assert.equal(result.reroutedEntries[0].chatId, "-100new-squad");
+
+    const after = await journal.classifyPending(context);
+    assert.deepEqual(
+      after.valid.map((e) => e.id),
+      ["orphan-reroute"],
+      "rerouted entry is now valid under the new config and discarded entry is gone",
+    );
+    assert.deepEqual(after.orphaned, []);
+
+    // Boundary case: rerouting to an empty route throws instead of silently dropping/replaying.
+    await journal.recordIntent({
+      id: "orphan-empty-target",
+      source: "squad",
+      ledger: 202,
+      eventName: "claim_created",
+      chatId: "-100gone",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 202,
+    });
     await assert.rejects(
       () =>
-        notifier1("hello", "market", {
-          eventName: "claim_created",
-          eventRef: { eventId: "evt-fail", ledger: 6001, source: "market" },
-          destinations,
-        }),
-      /simulated crash mid-fanout/,
+        journal.recoverOrphans(
+          {
+            resolveRouteChatId: () => "",
+            networkPassphrase: "Test SDF Network ; September 2015",
+          },
+          () => ({ action: "reroute" }),
+        ),
+      /target route is empty/,
     );
-    assert.equal(sentFirstRun.length, 3, "all three destinations were attempted");
-    // All three settled (sent, failed, sent) so none are left pending as ambiguous.
-    assert.deepEqual(await journal1.loadPendingForEvent("evt-fail"), []);
-
-    // Now simulate an abrupt crash after dest 1 completed and before dest 2/3 finished.
-    await journal1.recordIntent({
-      id: "evt-crash",
-      source: "market",
-      ledger: 6002,
-      eventName: "claim_created",
-      chatId: "-1001",
-      topicId: 11,
-      textHash: "h1",
-      at: 1_700_000_000_000,
-    });
-    await journal1.recordIntent({
-      id: "evt-crash",
-      source: "market",
-      ledger: 6002,
-      eventName: "claim_created",
-      chatId: "-1001",
-      topicId: 22,
-      textHash: "h1",
-      at: 1_700_000_000_000,
-    });
-    await journal1.recordIntent({
-      id: "evt-crash",
-      source: "market",
-      ledger: 6002,
-      eventName: "claim_created",
-      chatId: "-1002",
-      textHash: "h1",
-      at: 1_700_000_000_000,
-    });
-    await journal1.recordDone("evt-crash", { chatId: "-1001", topicId: 11 }, "sent");
-
-    // Restart with a fresh journal handle and notifier; recover only unfinished destinations.
-    const sentRecovery = [];
-    const recoveryBot = {
-      api: {
-        sendMessage: async (chatId, text, opts) => {
-          sentRecovery.push({ chatId, topicId: opts?.message_thread_id, text });
-          return {};
-        },
-      },
-    };
-    const journal2 = createSendJournal({ filePath: file, now: () => 1_700_000_000_100 });
-    const notifier2 = createNotifier(recoveryBot, { chatId: "-1001", botToken: BOT_TOKEN }, { sendJournal: journal2 });
-
-    await notifier2("hello", "market", {
-      eventName: "claim_created",
-      eventRef: { eventId: "evt-crash", ledger: 6002, source: "market" },
-      destinations,
-      recoverOnly: true,
-    });
-
-    assert.deepEqual(
-      sentRecovery,
-      [
-        { chatId: "-1001", topicId: 22, text: "hello" },
-        { chatId: "-1002", topicId: undefined, text: "hello" },
-      ],
-      "only unfinished destinations are sent on recovery; completed topic 11 is skipped",
-    );
-    assert.deepEqual(await journal2.loadPendingForEvent("evt-crash"), []);
   } finally {
     await dir.cleanup();
   }

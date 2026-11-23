@@ -45,7 +45,41 @@ export interface JournalEntry {
   outcome?: DeliveryOutcome;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
+  /** Resolved Telegram chat route at the time the intent was recorded. */
+  chatId?: string;
+  /** Stellar network passphrase at the time the intent was recorded. */
+  networkPassphrase?: string;
   at: number;
+}
+
+export type OrphanReason = "removed_route" | "network_changed";
+
+export interface OrphanedJournalEntry {
+  entry: JournalEntry;
+  reason: OrphanReason;
+  /** Current resolved route chat ID for this entry's source, if any. */
+  currentChatId?: string;
+  /** Current configured network passphrase, if any. */
+  currentNetworkPassphrase?: string;
+}
+
+export interface JournalRecoveryContext {
+  /** Resolve the current route chat ID for a given entry source (empty = removed). */
+  resolveRouteChatId?: (source: string) => string;
+  /** Current Stellar network passphrase. */
+  networkPassphrase?: string;
+}
+
+export type OrphanDecision =
+  | { action: "discard" }
+  | { action: "reroute"; chatId?: string; networkPassphrase?: string };
+
+export interface OrphanRecoveryResult {
+  valid: JournalEntry[];
+  orphaned: OrphanedJournalEntry[];
+  discarded: number;
+  rerouted: number;
+  reroutedEntries: JournalEntry[];
 }
 
 export interface SendJournalOptions {
@@ -69,6 +103,8 @@ export interface SendJournal {
     chatId?: string;
     topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
   }): Promise<void>;
   recordDone(
@@ -78,8 +114,19 @@ export interface SendJournal {
   ): Promise<void>;
   /** Intents with no matching done: notifications/destinations that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
-  /** Unfinished destination intents for a specific event id. */
-  loadPendingForEvent(id: string): Promise<JournalEntry[]>;
+  /** Partition pending entries into valid vs orphaned (removed route / changed network). */
+  classifyPending(context: JournalRecoveryContext): Promise<{
+    valid: JournalEntry[];
+    orphaned: OrphanedJournalEntry[];
+  }>;
+  /**
+   * Apply an explicit discard or reroute decision to each orphaned entry
+   * instead of silently replaying it under the new configuration.
+   */
+  recoverOrphans(
+    context: JournalRecoveryContext,
+    decide: (orphan: OrphanedJournalEntry) => OrphanDecision | Promise<OrphanDecision>,
+  ): Promise<OrphanRecoveryResult>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
 }
@@ -175,6 +222,8 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     chatId?: string;
     topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
   }): Promise<void> {
     await append({ kind: "intent", ...entry });
@@ -223,6 +272,116 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return pending.filter((e) => e.id === id);
   }
 
+  async function classifyPending(context: JournalRecoveryContext): Promise<{
+    valid: JournalEntry[];
+    orphaned: OrphanedJournalEntry[];
+  }> {
+    const pending = await loadPending();
+    const valid: JournalEntry[] = [];
+    const orphaned: OrphanedJournalEntry[] = [];
+
+    for (const entry of pending) {
+      if (
+        entry.networkPassphrase &&
+        context.networkPassphrase &&
+        entry.networkPassphrase !== context.networkPassphrase
+      ) {
+        orphaned.push({
+          entry,
+          reason: "network_changed",
+          currentNetworkPassphrase: context.networkPassphrase,
+          ...(context.resolveRouteChatId
+            ? { currentChatId: context.resolveRouteChatId(entry.source) }
+            : {}),
+        });
+        continue;
+      }
+
+      if (entry.chatId && context.resolveRouteChatId) {
+        const currentChatId = context.resolveRouteChatId(entry.source);
+        if (!currentChatId || currentChatId !== entry.chatId) {
+          orphaned.push({
+            entry,
+            reason: "removed_route",
+            currentChatId,
+            ...(context.networkPassphrase
+              ? { currentNetworkPassphrase: context.networkPassphrase }
+              : {}),
+          });
+          continue;
+        }
+      }
+
+      valid.push(entry);
+    }
+
+    return { valid, orphaned };
+  }
+
+  async function recoverOrphans(
+    context: JournalRecoveryContext,
+    decide: (orphan: OrphanedJournalEntry) => OrphanDecision | Promise<OrphanDecision>,
+  ): Promise<OrphanRecoveryResult> {
+    const { valid, orphaned } = await classifyPending(context);
+    if (orphaned.length === 0) {
+      return { valid, orphaned: [], discarded: 0, rerouted: 0, reroutedEntries: [] };
+    }
+
+    const entries = await readLines();
+    const doneIds = new Set<string>();
+    const rerouteMap = new Map<string, JournalEntry>();
+    let discarded = 0;
+    let rerouted = 0;
+    const reroutedEntries: JournalEntry[] = [];
+
+    for (const orphan of orphaned) {
+      const decision = await decide(orphan);
+      if (decision.action === "discard") {
+        doneIds.add(orphan.entry.id);
+        discarded += 1;
+      } else if (decision.action === "reroute") {
+        const nextChatId = decision.chatId ?? orphan.currentChatId ?? "";
+        if (!nextChatId) {
+          throw new Error(
+            `Cannot reroute orphaned journal entry ${orphan.entry.id}: target route is empty`,
+          );
+        }
+        const nextNetwork =
+          decision.networkPassphrase ??
+          context.networkPassphrase ??
+          orphan.entry.networkPassphrase;
+        const updated: JournalEntry = {
+          ...orphan.entry,
+          chatId: nextChatId,
+          ...(nextNetwork ? { networkPassphrase: nextNetwork } : {}),
+          at: now(),
+        };
+        rerouteMap.set(orphan.entry.id, updated);
+        rerouted += 1;
+        reroutedEntries.push(updated);
+      } else {
+        throw new Error(
+          `Invalid orphan decision for ${orphan.entry.id}: expected "discard" or "reroute"`,
+        );
+      }
+    }
+
+    const nextEntries: JournalEntry[] = [];
+    for (const entry of entries) {
+      if (entry.kind === "intent" && doneIds.has(entry.id)) {
+        continue;
+      }
+      if (entry.kind === "intent" && rerouteMap.has(entry.id)) {
+        nextEntries.push(rerouteMap.get(entry.id)!);
+        continue;
+      }
+      nextEntries.push(entry);
+    }
+    await persist(nextEntries);
+
+    return { valid, orphaned, discarded, rerouted, reroutedEntries };
+  }
+
   async function compact(): Promise<void> {
     const entries = await readLines();
     const done = new Set<string>();
@@ -258,5 +417,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, loadPendingForEvent, compact, stats };
+  return { recordIntent, recordDone, loadPending, classifyPending, recoverOrphans, compact, stats };
 }
