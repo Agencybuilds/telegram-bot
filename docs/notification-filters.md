@@ -168,54 +168,12 @@ NOTIFY_CATEGORIES=__none__
 
 ---
 
-## 4. Decimal USDC Threshold Normalization
+## 4. Atomic Filter Configuration Reloads
 
-Both [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) and [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) normalize equivalent decimal USDC thresholds to 7-decimal atomic units (`bigint`) before comparison:
+For programmatic filter sets combining typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and integer USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)), [`src/notifications/filter-reload.ts`](../src/notifications/filter-reload.ts) provides atomic configuration reloads:
 
-- **Canonical equivalence**: Equivalent decimal strings (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) normalize identically via `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (both explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`).
-- **Precision limit**: Values exceeding seven fractional digits (for example `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
-
----
-
-## 5. Filter Explanation Tree (Operator Diagnostics)
-
-[`explainFilterRule(rule, event, options?)`](../src/notifications/filter-expr.ts) explains *why* a parsed filter expression (and, optionally, the amount thresholds) allowed or denied one event. It is a dry-run diagnostic only: the live path still uses `evaluateFilterRule` and `meetsThreshold`, whose exports and semantics are unchanged.
-
-The tree mirrors the rule and its expression AST:
-
-| Node `kind` | When present | Meaning |
-| :--- | :--- | :--- |
-| `rule` | Always (root) | Final decision. `matched` and the top-level `reason` always equal `evaluateFilterRule` / `evaluateFilterDryRun`. |
-| `event-name` | The rule names an event | Whether the event is the named one. |
-| `and` / `or` | Logical operators in the condition | Children are the left and right operands, in source order. |
-| `comparison` | Each predicate in the condition | `matched`, `predicate-false`, or `missing-field`. |
-| `threshold` | `options.thresholds` is given | Amount threshold check, evaluated after the expression as in the live path. |
-
-Each node carries `matched`, an `outcome` (`matched`, `event-name-mismatch`, `missing-field`, `predicate-false`, `below-threshold`, `not-configured`, `not-evaluated`) and a short `reason`. Branches the live evaluator short-circuits (the right side of a failed `and` or a matched `or`, the condition after an event-name mismatch, the threshold after a failed expression) are reported as `not-evaluated`, so the tree shows exactly what the live path looked at. Output is deterministic and JSON-serializable (no `bigint` values).
-
-`renderFilterExplanation(explanation)` renders the tree as indented plain text, one line per node. For the rule `claim_challenged where (stake >= 100 USDC and challenger != "G…") or claimId == 42` with a 10 USDC challenge threshold, against a synthetic 25 USDC challenge on claim 7:
-
-```text
-✗ [rule] rule failed (predicate-false): event denied
-  ✓ [event-name] event is claim_challenged
-  ✗ [or] or: neither side matched
-    ✗ [and] and: left side failed; right side not evaluated
-      ✗ [comparison] stake >= 100 USDC: false
-      - [comparison] challenger != <redacted>: not evaluated
-    ✗ [comparison] claimId == 42: false
-  - [threshold] amount threshold: not evaluated
-```
-
-### 5.1 Privacy
-
-Reasons never contain payload values: no addresses, claim titles, summaries, questions, categories, or amounts from the event. String literals written in the rule (which may hold an address, a chat or route identity, or message text) are shown as `<redacted>`. Only schema field names, operators, numeric literals, USDC amounts written in the rule, configured threshold minimums, and the rule's own (schema-validated) event name appear. On an event-name mismatch the event's actual name is not echoed.
-
-### 5.2 Bounds
-
-| Option | Default | Minimum | Effect |
-| :--- | :--- | :--- | :--- |
-| `maxNodes` | `MAX_EXPLANATION_NODES` (64) | 1 | Nodes kept, in pre-order. |
-| `maxDepth` | `MAX_EXPLANATION_DEPTH` (32) | 0 | Levels kept below the root. |
-| `maxReasonLength` | `MAX_EXPLANATION_REASON_LENGTH` (96) | 8 | Characters per `reason`; longer reasons end in `…`. |
-
-Dropped subtrees are counted in the parent's `omitted` field and `truncated` is set to `true`; truncation never changes `matched` or `reason`. Invalid values (`NaN`, `Infinity`) fall back to the default and values below the minimum are raised to it. The defaults fit the largest expression the parser accepts (`MAX_FILTER_TOKENS`, a left-deep chain of 24 comparisons) without truncation.
+- **`compileFilterConfig(candidate, version?)`**: Validates the entire candidate configuration (every expression in `expressions` and every threshold in `thresholds`) upfront and returns a frozen `CompiledFilterSet`. If any field is invalid, it throws `FilterConfigValidationError` with all collected `issues`—partial configurations are never produced.
+- **`AtomicFilterReloader`**:
+  - `reload(candidate)` compiles and validates the full candidate before performing a single atomic reference swap to the new `CompiledFilterSet`. On failure, it returns `{ ok: false, applied: false, error, filterSet }` and retains the previous working filter set unchanged (version does not increment).
+  - `reloadOrThrow(candidate)` performs the same atomic swap and throws `FilterConfigValidationError` on failure while retaining the previous working filter set.
+  - `matches(event)` evaluates an event against the active immutable snapshot via `evaluateFilterSet` (requires `meetsThreshold` and, when `rules` is non-empty, at least one matching `FilterRule`).
