@@ -276,6 +276,15 @@ function validateBackupOwnership(
   }
 }
 
+function expectedFingerprints(
+  config: TargetFingerprintConfig,
+): Record<string, string> {
+  return {
+    market: computeCursorTargetFingerprint(config.networkPassphrase, config.marketContractId),
+    squad: computeCursorTargetFingerprint(config.networkPassphrase, config.squadContractId),
+  };
+}
+
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
   await assertDifferentPaths(options.cursorFile, options.backupFile);
@@ -579,6 +588,22 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
+function resolveTargetConfigFromEnv(): TargetFingerprintConfig | undefined {
+  const marketContractId = process.env.MARKET_CONTRACT_ID?.trim();
+  const squadContractId = process.env.SQUAD_CONTRACT_ID?.trim();
+  if (!marketContractId || !squadContractId) return undefined;
+
+  const network = process.env.STELLAR_NETWORK?.trim().toLowerCase();
+  const defaultPassphrase =
+    network === "mainnet" || network === "futurenet" || network === "testnet"
+      ? NETWORK_PASSPHRASES[network]
+      : NETWORK_PASSPHRASES.testnet;
+  const networkPassphrase =
+    process.env.STELLAR_NETWORK_PASSPHRASE?.trim() || defaultPassphrase;
+
+  return { networkPassphrase, marketContractId, squadContractId };
+}
+
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
@@ -644,6 +669,21 @@ async function main(): Promise<void> {
       options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,
     );
     await backupCursor({ cursorFile, backupFile, force: options.force });
+    return;
+  }
+
+  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  if (action === "migrate") {
+    const targets = resolveTargetConfigFromEnv();
+    if (!targets) {
+      throw new Error("migrate requires MARKET_CONTRACT_ID and SQUAD_CONTRACT_ID");
+    }
+    await migrateCursor({
+      cursorFile,
+      lockFile,
+      force: options.force,
+      ...targets,
+    });
     return;
   }
 
