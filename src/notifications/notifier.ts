@@ -406,6 +406,7 @@ export function createNotifier(
       // Plain text (no parse mode), same per-source link preview setting.
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
+        ...threadOption,
         ...silentOption,
         ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
