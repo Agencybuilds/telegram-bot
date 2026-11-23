@@ -89,21 +89,56 @@ export interface Gauge {
   value(): number;
 }
 
-export interface MetricsServerOptions {
-  /**
-   * Milliseconds to wait for active or stalled client sockets to close during
-   * shutdown before force-closing them. Defaults to
-   * {@link DEFAULT_HEALTH_SHUTDOWN_GRACE_MS}; `0` force-closes immediately.
-   */
-  shutdownGraceMs?: number;
+/**
+ * Stable, low-cardinality destination classes for pending delivery queue age.
+ * Never use chat IDs or event IDs as labels.
+ */
+export type DeliveryDestinationClass = "channel" | "group" | "dm" | "dead_letter";
+
+export const DELIVERY_DESTINATION_CLASSES: readonly DeliveryDestinationClass[] = [
+  "channel",
+  "group",
+  "dm",
+  "dead_letter",
+] as const;
+
+/** Fixed finite upper bounds (in seconds) for pending delivery queue age histograms. */
+export const QUEUE_AGE_BUCKETS_SECONDS: readonly number[] = [
+  1, 5, 15, 30, 60, 300, 900, 3600,
+] as const;
+
+export interface QueueAgeBucketSnapshot {
+  /** Upper bound in seconds, or `"+Inf"` for the cumulative catch-all bucket. */
+  le: number | "+Inf";
+  /** Cumulative count of observations less than or equal to `le`. */
+  count: number;
 }
 
-export interface MetricsCloseOptions {
+export interface QueueAgeDestinationSnapshot {
+  buckets: QueueAgeBucketSnapshot[];
+  sum: number;
+  count: number;
+}
+
+export interface QueueAgeHistogram {
+  /** Fixed finite bucket upper bounds in seconds (excluding `+Inf`). */
+  readonly buckets: readonly number[];
+  /** Stable destination classes accepted by this histogram. */
+  readonly destinations: readonly DeliveryDestinationClass[];
   /**
-   * Milliseconds to wait for active or stalled client sockets to close during
-   * shutdown before force-closing them. Overrides `shutdownGraceMs`.
+   * Observe a pending delivery queue age in seconds for a stable destination class.
+   * Throws `RangeError` for unknown destination classes (e.g. chat IDs or event IDs)
+   * or negative/non-finite ages.
    */
-  gracePeriodMs?: number;
+  observe(destination: DeliveryDestinationClass, ageSeconds: number): void;
+  /**
+   * Observe a pending delivery queue age computed from `nowMs - enqueuedAtMs`.
+   * Clock skew (`nowMs < enqueuedAtMs`) is clamped to 0 seconds.
+   * Throws `RangeError` for unknown destination classes or non-finite timestamps.
+   */
+  observeSince(destination: DeliveryDestinationClass, enqueuedAtMs: number, nowMs?: number): void;
+  /** Return a snapshot of cumulative bucket counts, sum, and count for `destination`. */
+  snapshot(destination: DeliveryDestinationClass): QueueAgeDestinationSnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -161,56 +196,9 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
-  /**
-   * Samples dropped before exposure, labelled by bounded reason
-   * (`invalid_number`, `unknown_label`, or `unknown`).
-   */
-  droppedSamples: LabeledCounter;
-  /** Count one dropped sample under a bounded reason (unknown reasons fold into `unknown`). */
-  recordDropped(reason: string): void;
-  /** Record a numeric sample for a gauge; non-finite values are dropped and counted. */
-  setGaugeSafe(gauge: Gauge, value: number): void;
-  /** Total confirmed notifications with a known ledger close time (includes 0ms lag). */
-  notificationAgeSamples: Counter;
-  /** Total confirmed notifications whose event lacked a valid ledger close time. */
-  notificationAgeMissingLedgerTime: Counter;
-  /** Cumulative end-to-end notification age in milliseconds across known-ledger-time samples. */
-  notificationAgeTotalMs: Counter;
-  /** End-to-end age in ms of the most recent confirmed notification with a known ledger time. */
-  lastNotificationAgeMs: Gauge;
-  /** Maximum observed end-to-end notification age in ms across confirmed sends. */
-  maxNotificationAgeMs: Gauge;
-
-  /**
-   * Record one confirmed notification's end-to-end age in milliseconds, or `null`
-   * when the source event lacked a valid ledger close time. Distinguishes missing
-   * ledger time (`notificationAgeMissingLedgerTime`) from zero delivery lag
-   * (`notificationAgeSamples` incremented with `0` ms).
-   */
-  recordNotificationAge(ageMs: number | null): void;
-
-  /** Bounded rolling service-level window tracker. */
-  serviceLevel: ServiceLevelWindow;
-
-  /**
-   * Generate the machine-readable service-level window report from bounded local samples.
-   */
-  serviceLevelReport(): ServiceLevelWindowReport;
-
-  /**
-   * Record a delivery attempt into the service-level window.
-   */
-  recordDelivery(
-    success: boolean,
-    ageMs?: number | null,
-    dataGap?: boolean,
-    gapReason?: ServiceLevelIncompleteReason,
-  ): void;
-
-  /**
-   * Record a data gap event into the service-level window.
-   */
-  recordDataGap(reason?: ServiceLevelIncompleteReason): void;
+  /** Fixed-bucket queue age histogram (in seconds) for pending deliveries,
+   *  partitioned by stable destination class (never chat IDs or event IDs). */
+  pendingDeliveryQueueAge: QueueAgeHistogram;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -272,6 +260,93 @@ function makeFiniteGauge(
     value(): number {
       return _value;
     },
+  };
+}
+
+function roundSum(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function makeQueueAgeHistogram(
+  name: string,
+  help: string,
+  buckets: readonly number[] = QUEUE_AGE_BUCKETS_SECONDS,
+  destinations: readonly DeliveryDestinationClass[] = DELIVERY_DESTINATION_CLASSES,
+): QueueAgeHistogram & { _name: string; _help: string } {
+  const fixedBuckets = Object.freeze([...buckets]);
+  const fixedDestinations = Object.freeze([...destinations]);
+  const state = new Map<
+    DeliveryDestinationClass,
+    { bucketCounts: number[]; sum: number; count: number }
+  >();
+
+  for (const dest of fixedDestinations) {
+    state.set(dest, {
+      bucketCounts: new Array<number>(fixedBuckets.length).fill(0),
+      sum: 0,
+      count: 0,
+    });
+  }
+
+  function requireDestination(destination: DeliveryDestinationClass) {
+    const entry = state.get(destination);
+    if (!entry) {
+      throw new RangeError(
+        `Invalid destination class "${String(destination)}"; expected one of: ${fixedDestinations.join(", ")}`,
+      );
+    }
+    return entry;
+  }
+
+  function observe(destination: DeliveryDestinationClass, ageSeconds: number): void {
+    const entry = requireDestination(destination);
+    if (!Number.isFinite(ageSeconds) || ageSeconds < 0) {
+      throw new RangeError(`Queue age must be a finite number >= 0; got ${ageSeconds}`);
+    }
+    for (let i = 0; i < fixedBuckets.length; i++) {
+      if (ageSeconds <= fixedBuckets[i]!) {
+        entry.bucketCounts[i]! += 1;
+      }
+    }
+    entry.sum += ageSeconds;
+    entry.count += 1;
+  }
+
+  function observeSince(
+    destination: DeliveryDestinationClass,
+    enqueuedAtMs: number,
+    nowMs: number = Date.now(),
+  ): void {
+    requireDestination(destination);
+    if (!Number.isFinite(enqueuedAtMs) || !Number.isFinite(nowMs)) {
+      throw new RangeError("Queue timestamps must be finite numbers");
+    }
+    const ageSeconds = Math.max(0, (nowMs - enqueuedAtMs) / 1000);
+    observe(destination, ageSeconds);
+  }
+
+  function snapshot(destination: DeliveryDestinationClass): QueueAgeDestinationSnapshot {
+    const entry = requireDestination(destination);
+    const bucketSnapshots: QueueAgeBucketSnapshot[] = fixedBuckets.map((le, i) => ({
+      le,
+      count: entry.bucketCounts[i]!,
+    }));
+    bucketSnapshots.push({ le: "+Inf", count: entry.count });
+    return {
+      buckets: bucketSnapshots,
+      sum: roundSum(entry.sum),
+      count: entry.count,
+    };
+  }
+
+  return {
+    _name: name,
+    _help: help,
+    buckets: fixedBuckets,
+    destinations: fixedDestinations,
+    observe,
+    observeSince,
+    snapshot,
   };
 }
 
@@ -375,25 +450,9 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
-  const notificationAgeSamples = makeCounter(
-    `${METRICS_PREFIX}notification_age_samples_total`,
-    "Total confirmed notifications with a known ledger close time (includes 0ms lag).",
-  );
-  const notificationAgeMissingLedgerTime = makeCounter(
-    `${METRICS_PREFIX}notification_age_missing_ledger_time_total`,
-    "Total confirmed notifications whose event lacked a valid ledger close time.",
-  );
-  const notificationAgeTotalMs = makeCounter(
-    `${METRICS_PREFIX}notification_age_ms_total`,
-    "Cumulative end-to-end notification age in milliseconds from ledger close time to confirmed send.",
-  );
-  const lastNotificationAgeMs = makeGauge(
-    `${METRICS_PREFIX}last_notification_age_ms`,
-    "End-to-end age in milliseconds of the most recent confirmed notification with a known ledger close time.",
-  );
-  const maxNotificationAgeMs = makeGauge(
-    `${METRICS_PREFIX}max_notification_age_ms`,
-    "Maximum observed end-to-end notification age in milliseconds from ledger close time to confirmed send.",
+  const pendingDeliveryQueueAge = makeQueueAgeHistogram(
+    `${METRICS_PREFIX}pending_delivery_queue_age_seconds`,
+    "Age in seconds of pending deliveries in queue, partitioned by stable destination class.",
   );
 
   const counters = [
@@ -413,45 +472,8 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     notificationAgeMissingLedgerTime,
     notificationAgeTotalMs,
   ];
-  const gauges = [
-    consecutiveFailures,
-    lastCycleEvents,
-    activityBaselineEvents,
-    lastNotificationAgeMs,
-    maxNotificationAgeMs,
-  ];
-
-  const baseFailedInc = notificationsFailed.inc;
-  notificationsFailed.inc = (delta = 1) => {
-    baseFailedInc(delta);
-    for (let i = 0; i < delta; i += 1) {
-      serviceLevel.recordDelivery(false, null);
-    }
-  };
-
-  const baseStaleCursorInc = staleCursorEvents.inc;
-  staleCursorEvents.inc = (delta = 1) => {
-    baseStaleCursorInc(delta);
-    for (let i = 0; i < delta; i += 1) {
-      serviceLevel.recordDataGap("stale_cursor");
-    }
-  };
-
-  function recordNotificationAge(ageMs: number | null): void {
-    if (ageMs === null || typeof ageMs !== "number" || !Number.isFinite(ageMs)) {
-      notificationAgeMissingLedgerTime.inc();
-      serviceLevel.recordDelivery(true, null, true, "missing_ledger_time");
-      return;
-    }
-    const clampedMs = Math.max(0, Math.round(ageMs));
-    notificationAgeSamples.inc();
-    notificationAgeTotalMs.inc(clampedMs);
-    lastNotificationAgeMs.set(clampedMs);
-    if (clampedMs > maxNotificationAgeMs.value()) {
-      maxNotificationAgeMs.set(clampedMs);
-    }
-    serviceLevel.recordDelivery(true, clampedMs, false);
-  }
+  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  const histograms = [pendingDeliveryQueueAge];
 
   function render(): string {
     const lines: string[] = [];
@@ -472,6 +494,21 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
       lines.push(`# HELP ${g._name} ${g._help}`);
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
+    }
+
+    for (const h of histograms) {
+      lines.push(`# HELP ${h._name} ${h._help}`);
+      lines.push(`# TYPE ${h._name} histogram`);
+      for (const destination of h.destinations) {
+        const snap = h.snapshot(destination);
+        for (const bucket of snap.buckets) {
+          lines.push(
+            `${h._name}_bucket{destination="${destination}",le="${bucket.le}"} ${bucket.count}`,
+          );
+        }
+        lines.push(`${h._name}_sum{destination="${destination}"} ${snap.sum}`);
+        lines.push(`${h._name}_count{destination="${destination}"} ${snap.count}`);
+      }
     }
 
     // Prometheus text format requires a trailing newline.
@@ -650,38 +687,7 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
-    droppedSamples,
-    recordDropped(reason: string): void {
-      droppedSamples.inc(reason);
-    },
-    setGaugeSafe(gauge: Gauge, value: number): void {
-      if (!Number.isFinite(value)) {
-        droppedSamples.inc("invalid_number");
-        return;
-      }
-      gauge.set(value);
-    },
-    notificationAgeSamples,
-    notificationAgeMissingLedgerTime,
-    notificationAgeTotalMs,
-    lastNotificationAgeMs,
-    maxNotificationAgeMs,
-    recordNotificationAge,
-    serviceLevel,
-    serviceLevelReport(): ServiceLevelWindowReport {
-      return serviceLevel.report();
-    },
-    recordDelivery(
-      success: boolean,
-      ageMs?: number | null,
-      dataGap?: boolean,
-      gapReason?: ServiceLevelIncompleteReason,
-    ): void {
-      serviceLevel.recordDelivery(success, ageMs, dataGap, gapReason);
-    },
-    recordDataGap(reason?: ServiceLevelIncompleteReason): void {
-      serviceLevel.recordDataGap(reason);
-    },
+    pendingDeliveryQueueAge,
     render,
     startServer,
   };
