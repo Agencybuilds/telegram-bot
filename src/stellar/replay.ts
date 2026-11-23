@@ -247,36 +247,125 @@ export class RpcBudgetTracker {
   }
 }
 
-// ── Event-Count Budget Tracker ───────────────────────────────────────────────
+// ── Page Ledger Boundary Consistency ─────────────────────────────────────────
 
-export class EventBudgetTracker {
-  readonly limit: number;
-  private usedCount: number = 0;
+export type ReplayConsistencyProblem =
+  | "latest-ledger-regressed"
+  | "cursor-ledger-regressed"
+  | "event-ledger-regressed"
+  | "cursor-behind-page-event";
 
-  constructor(limit: number) {
-    if (!Number.isInteger(limit) || limit < 1) {
-      throw new Error(`--max-events must be a positive integer, got ${limit}`);
+/**
+ * Bounded consistency error thrown when a replay RPC page reports nonmonotonic
+ * ledger boundaries (regressing `latestLedger`, regressing `cursor` ledger,
+ * regressing event ledgers, or a cursor behind events on the same page).
+ */
+export class ReplayConsistencyError extends Error {
+  readonly problem: ReplayConsistencyProblem;
+
+  constructor(problem: ReplayConsistencyProblem, message: string) {
+    super(message);
+    this.name = "ReplayConsistencyError";
+    this.problem = problem;
+  }
+}
+
+export interface ReplayPageBoundaryState {
+  latestLedger: number;
+  previousCursorLedger: number | null;
+  lastEventLedger: number | null;
+}
+
+/**
+ * Validate that a replay RPC page's ledger boundaries are monotonic with
+ * respect to the previously committed replay state and within the page itself.
+ *
+ * Must be called before dispatching notifications or committing a checkpoint so
+ * that a rejected page leaves the previously committed checkpoint unchanged.
+ */
+export function validateReplayPageLedgerBoundaries(
+  response: rpc.Api.GetEventsResponse | null | undefined,
+  state: ReplayPageBoundaryState,
+): { nextCursorLedger: number | null } {
+  const responseLatest = response?.latestLedger;
+  if (
+    typeof responseLatest === "number" &&
+    Number.isSafeInteger(responseLatest) &&
+    responseLatest < state.latestLedger
+  ) {
+    throw new ReplayConsistencyError(
+      "latest-ledger-regressed",
+      `replay RPC page latestLedger regressed from ${state.latestLedger} to ${responseLatest}`,
+    );
+  }
+
+  const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
+  const nextCursorLedger = nextCursor ? eventCursorLedger(nextCursor) : null;
+
+  if (nextCursorLedger !== null) {
+    if (
+      state.previousCursorLedger !== null &&
+      nextCursorLedger < state.previousCursorLedger
+    ) {
+      throw new ReplayConsistencyError(
+        "cursor-ledger-regressed",
+        `replay RPC page cursor ledger regressed from ${state.previousCursorLedger} to ${nextCursorLedger}`,
+      );
     }
-    this.limit = limit;
+    if (
+      state.lastEventLedger !== null &&
+      nextCursorLedger < state.lastEventLedger
+    ) {
+      throw new ReplayConsistencyError(
+        "cursor-ledger-regressed",
+        `replay RPC page cursor ledger ${nextCursorLedger} regressed behind committed event ledger ${state.lastEventLedger}`,
+      );
+    }
   }
 
-  get used(): number {
-    return this.usedCount;
+  const committedFloor =
+    state.lastEventLedger !== null && state.previousCursorLedger !== null
+      ? Math.max(state.lastEventLedger, state.previousCursorLedger)
+      : (state.lastEventLedger ?? state.previousCursorLedger);
+
+  const rawEvents = Array.isArray(response?.events) ? response.events : [];
+  let prevRawLedger: number | null = null;
+  let pageMaxLedger: number | null = null;
+
+  for (const raw of rawEvents) {
+    if (!raw || typeof raw !== "object") continue;
+    const ledger = (raw as { ledger?: unknown }).ledger;
+    if (typeof ledger !== "number" || !Number.isSafeInteger(ledger) || ledger <= 0) {
+      continue;
+    }
+    if (committedFloor !== null && ledger < committedFloor) {
+      throw new ReplayConsistencyError(
+        "event-ledger-regressed",
+        `replay RPC page event ledger ${ledger} regressed behind committed boundary ${committedFloor}`,
+      );
+    }
+    if (prevRawLedger !== null && ledger < prevRawLedger) {
+      throw new ReplayConsistencyError(
+        "event-ledger-regressed",
+        `replay RPC page event ledgers are nonmonotonic (${prevRawLedger} followed by ${ledger})`,
+      );
+    }
+    prevRawLedger = ledger;
+    pageMaxLedger = pageMaxLedger === null ? ledger : Math.max(pageMaxLedger, ledger);
   }
 
-  get remaining(): number {
-    return Math.max(0, this.limit - this.usedCount);
+  if (
+    nextCursorLedger !== null &&
+    pageMaxLedger !== null &&
+    nextCursorLedger < pageMaxLedger
+  ) {
+    throw new ReplayConsistencyError(
+      "cursor-behind-page-event",
+      `replay RPC page cursor ledger ${nextCursorLedger} is behind page event ledger ${pageMaxLedger}`,
+    );
   }
 
-  get exhausted(): boolean {
-    return this.usedCount >= this.limit;
-  }
-
-  consume(): boolean {
-    if (this.usedCount >= this.limit) return false;
-    this.usedCount += 1;
-    return true;
-  }
+  return { nextCursorLedger };
 }
 
 // ── Core replay function ──────────────────────────────────────────────────────
@@ -900,6 +989,7 @@ async function replayContract(
   let usedStartLedger: number | null = null;
   let usedStartClamped = false;
   let previousCursor = startCursor ?? "";
+  let previousCursorLedger: number | null = startCursor ? eventCursorLedger(startCursor) : null;
   const eventLog: ReplayEventSummary[] = [];
 
   const firstStartLedger = startLedger ?? window.oldestLedger;
@@ -938,11 +1028,12 @@ async function replayContract(
       ? await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], cursor, limit: pageLimit }))
       : await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], startLedger: firstStartLedger, limit: pageLimit }));
 
-    if (opts.signal?.aborted) {
-      pagesInThisRun -= 1;
-      cancelled = true;
-      break;
-    }
+    // Reject nonmonotonic ledger boundaries before decoding, sending, or committing a checkpoint.
+    const { nextCursorLedger } = validateReplayPageLedgerBoundaries(response, {
+      latestLedger,
+      previousCursorLedger,
+      lastEventLedger,
+    });
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     const pageDecoded: DecodedEvent[] = [];
@@ -1169,7 +1260,7 @@ async function replayContract(
       isFinalPage = true;
     } else {
       lastCursor = nextCursor;
-      const reached = eventCursorLedger(nextCursor);
+      const reached = nextCursorLedger;
       if (reached !== null && reached >= latestLedger) {
         isFinalPage = true;
       }
@@ -1178,6 +1269,9 @@ async function replayContract(
         isFinalPage = true;
       }
       previousCursor = nextCursor;
+      if (reached !== null) {
+        previousCursorLedger = reached;
+      }
       cursor = nextCursor;
     }
 
