@@ -43,6 +43,7 @@ import {
   type DeadLetterEntry,
   type DeadLetterStatusSummary,
 } from "./deadLetter.js";
+import { formatDuration } from "./notifications/time.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
@@ -377,8 +378,8 @@ function shouldPurgeEntry(
   cutoffMs: number | null,
 ): boolean {
   if (cutoffMs === null) return true;
-  const enqueuedMs = Date.parse(entry.enqueuedAt);
-  if (!Number.isFinite(enqueuedMs)) return false;
+  const enqueuedMs = parseEntryTimestampMs(entry.enqueuedAt);
+  if (enqueuedMs === null) return false;
   return enqueuedMs < cutoffMs;
 }
 
@@ -731,30 +732,9 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
-function formatStatusOutput(
-  summary: DeadLetterStatusSummary,
-  filePath: string,
-  asJson: boolean,
-): string {
-  if (asJson) {
-    return `${JSON.stringify({ file: filePath, ...summary }, null, 2)}\n`;
-  }
-  if (summary.depth === 0) {
-    return `[dlq] status: depth=0 (empty) in ${filePath}`;
-  }
-  const sources = Object.entries(summary.bySource)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, count]) => `${key}=${count}`)
-    .join(", ");
-  const reasons = Object.entries(summary.byReason)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, count]) => `${key}=${count}`)
-    .join(", ");
-  return (
-    `[dlq] status: depth=${summary.depth} sources=[${sources}] reasons=[${reasons}] ` +
-    `maxAttempts=${summary.maxAttemptsSeen} oldest=${summary.oldestEnqueuedAt ?? "none"} ` +
-    `newest=${summary.newestEnqueuedAt ?? "none"} in ${filePath}`
-  );
+function formatAgeLabel(ageMs: number | null): string | null {
+  if (ageMs === null) return null;
+  return formatDuration(Math.floor(ageMs / 1_000));
 }
 
 function formatListOutput(
@@ -762,18 +742,44 @@ function formatListOutput(
   filePath: string,
   chatId: string,
   asJson: boolean,
+  nowMs: number,
 ): string {
+  const ageSummary = summarizeDeadLetterAge(entries, nowMs);
+  const oldestAge = formatAgeLabel(ageSummary.ageMs);
+
   if (asJson) {
-    return `${JSON.stringify({ file: filePath, chatId, depth: entries.length, entries }, null, 2)}\n`;
+    return `${JSON.stringify(
+      {
+        file: filePath,
+        chatId,
+        depth: entries.length,
+        oldestEnqueuedAt: ageSummary.oldestEnqueuedAt,
+        oldestAgeMs: ageSummary.ageMs,
+        oldestAge,
+        missingTimestamps: ageSummary.missingTimestamps,
+        entries,
+      },
+      null,
+      2,
+    )}\n`;
   }
   if (entries.length === 0) {
     return `[dlq] 0 entries (chat=${chatId}) in ${filePath}`;
   }
+  const missingSuffix =
+    ageSummary.missingTimestamps > 0
+      ? `, ${ageSummary.missingTimestamps} missing timestamp(s)`
+      : "";
+  const agePart =
+    oldestAge !== null
+      ? `age=${oldestAge}${missingSuffix}`
+      : `age=unknown (missing legacy timestamp${ageSummary.missingTimestamps > 1 ? "s" : ""})`;
+
   const lines = [
-    `[dlq] ${entries.length} entry(s) (chat=${chatId}) in ${filePath}`,
+    `[dlq] ${entries.length} entry(s) (chat=${chatId}, ${agePart}) in ${filePath}`,
     ...entries.map(
       (e) =>
-        `  ${e.id}  enqueued=${e.enqueuedAt}  source=${e.source}  ledger=${e.ledger}  ` +
+        `  ${e.id}  enqueued=${e.enqueuedAt ?? "unknown"}  source=${e.source}  ledger=${e.ledger}  ` +
         `event=${e.eventName}  attempts=${e.attempts}  chat=${e.chatId}  ` +
         (e.networkPassphrase ? `network=${boundText(e.networkPassphrase, 64)}  ` : "") +
         `lastError=${boundText(e.lastError ?? "none", 120)}`,
@@ -782,13 +788,18 @@ function formatListOutput(
   return lines.join("\n");
 }
 
-function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
+function formatShowOutput(entry: DlqEntryView, asJson: boolean, nowMs: number): string {
+  const enqueuedMs = parseEntryTimestampMs(entry.enqueuedAt);
+  const ageMs = enqueuedMs === null ? null : Math.max(0, nowMs - enqueuedMs);
+  const age = formatAgeLabel(ageMs);
+
   if (asJson) {
-    return `${JSON.stringify(entry, null, 2)}\n`;
+    return `${JSON.stringify({ ...entry, ageMs, age }, null, 2)}\n`;
   }
   return [
     `id:         ${entry.id}`,
-    `enqueuedAt: ${entry.enqueuedAt}`,
+    `enqueuedAt: ${entry.enqueuedAt ?? "unknown (missing legacy timestamp)"}`,
+    `age:        ${age ?? "unknown (missing legacy timestamp)"}`,
     `source:     ${entry.source}`,
     `ledger:     ${entry.ledger}`,
     `eventName:  ${entry.eventName}`,
@@ -891,6 +902,8 @@ export async function runDlqCli(
     now: options.now,
   };
 
+  const nowMs = (options.now ?? Date.now)();
+
   try {
     if (parsed.subcommand === "status") {
       const summary = await getDeadLetterStatus(commonOptions);
@@ -901,13 +914,13 @@ export async function runDlqCli(
     if (parsed.subcommand === "list") {
       const entries = await listDeadLetters(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);
-      out(formatListOutput(entries, filePath, chatId, parsed.json).trimEnd());
+      out(formatListOutput(entries, filePath, chatId, parsed.json, nowMs).trimEnd());
       return { exitCode: 0 };
     }
 
     if (parsed.subcommand === "show") {
       const entry = await showDeadLetter({ ...commonOptions, id: parsed.id! });
-      out(formatShowOutput(entry, parsed.json).trimEnd());
+      out(formatShowOutput(entry, parsed.json, nowMs).trimEnd());
       return { exitCode: 0 };
     }
 

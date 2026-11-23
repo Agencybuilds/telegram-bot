@@ -13,7 +13,11 @@ import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
 
-import { createDeadLetterQueue, makeEntryId } from "../dist/deadLetter.js";
+import {
+  createDeadLetterQueue,
+  makeEntryId,
+  summarizeDeadLetterAge,
+} from "../dist/deadLetter.js";
 
 const BOT_TOKEN = "1234567890:" + "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
