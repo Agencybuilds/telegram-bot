@@ -114,46 +114,17 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
 }
 
 /**
- * Return the next UTC timestamp (ms) at or after `nowMs` that is outside
- * `policy`'s quiet-hours window. Returns `nowMs` unchanged when no quiet-hours
- * window is active at `nowMs`.
+ * Normalize an event's chain close timestamp (`at`, unix seconds) into a
+ * strictly comparable rank for deterministic digest sorting. Positive finite
+ * timestamps sort chronologically; missing/zero/non-finite timestamps sort
+ * deterministically after known timestamps so tie-breaking falls through to
+ * canonical chain identity without violating transitivity.
  */
-export function nextAllowedWindowStart(
-  policy: QuietHoursPolicy | undefined,
-  nowMs: number,
-): number {
-  if (!Number.isFinite(nowMs)) {
-    throw new ScheduleParseError("nowMs must be a finite number");
+export function normalizeDigestEventTimestamp(at: unknown): number {
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) {
+    return Number.MAX_SAFE_INTEGER;
   }
-  if (!policy || !isInQuietHours(policy, nowMs)) {
-    return nowMs;
-  }
-  const win = extractWindow(policy);
-  if (!win || win.startMinutes === win.endMinutes) {
-    return nowMs;
-  }
-  const dayStart = startOfUtcDay(nowMs);
-  const currentMinutes = getUtcMinutesOfDay(nowMs);
-  if (win.startMinutes < win.endMinutes) {
-    return dayStart + win.endMinutes * 60 * 1000;
-  }
-  if (currentMinutes >= win.startMinutes) {
-    return dayStart + MS_PER_DAY + win.endMinutes * 60 * 1000;
-  }
-  return dayStart + win.endMinutes * 60 * 1000;
-}
-
-/**
- * Compute the next scheduled run timestamp (ms), deferring it to the end of
- * `quietHours` if the scheduled time falls inside quiet hours.
- */
-export function nextAllowedRun(
-  schedule: Schedule,
-  nowMs: number,
-  quietHours?: QuietHoursPolicy,
-): number {
-  const candidate = nextRun(schedule, nowMs);
-  return quietHours ? nextAllowedWindowStart(quietHours, candidate) : candidate;
+  return Math.trunc(at);
 }
 
 export interface LastRunStore {
