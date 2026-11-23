@@ -349,29 +349,13 @@ export function createNotifier(
   ): Promise<void> {
     const replyToMessageId = omitReplyTo ? undefined : extra?.replyToMessageId;
 
-    try {
-      // Oversized payloads go out as ordered chunks under Telegram's limit. The
-      // thread reply rides on the first chunk and the explorer button on the
-      // last, so the message reads exactly like the unsplit one.
-      const parts = splitTelegramMessage(text);
-      if (parts.length > 1) {
-        for (const [index, part] of parts.entries()) {
-          await bot.api.sendMessage(chatId, part, {
-            ...notificationOptions,
-            ...(index === parts.length - 1 && extra?.reply_markup
-              ? { reply_markup: extra.reply_markup }
-              : {}),
-            ...(index === 0 && extra?.replyToMessageId !== undefined
-              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-              : {}),
-          });
-        }
-        cooldowns.clearCooldown(chatId);
-        return;
-      }
-
-      try {
-        await bot.api.sendMessage(chatId, text, {
+    // Oversized payloads go out as ordered chunks under Telegram's limit. The
+    // thread reply rides on the first chunk and the explorer button on the
+    // last, so the message reads exactly like the unsplit one.
+    const parts = splitTelegramMessage(text);
+    if (parts.length > 1) {
+      for (const [index, part] of parts.entries()) {
+        await sendToRoute(chatId, part, {
           ...notificationOptions,
           ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
           ...(extra?.replyToMessageId !== undefined
@@ -387,7 +371,7 @@ export function createNotifier(
     }
 
     try {
-      await bot.api.sendMessage(chatId, text, {
+      await sendToRoute(chatId, text, {
         ...notificationOptions,
         ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
@@ -415,7 +399,7 @@ export function createNotifier(
           `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
+      await sendToRoute(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...threadOption,
         ...silentOption,
