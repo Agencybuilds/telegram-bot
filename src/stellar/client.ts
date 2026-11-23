@@ -15,61 +15,7 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
-import {
-  classifyRpcFailure,
-  formatClassifiedRpcFailure,
-  isRetryableRpcFailure,
-  type RpcFailureCategory,
-  type RpcFailureClassification,
-  type RpcFailureReasonCode,
-} from "./rpc-guard.js";
-
-export {
-  classifyRpcFailure,
-  formatClassifiedRpcFailure,
-  isRetryableRpcFailure,
-  type RpcFailureCategory,
-  type RpcFailureClassification,
-  type RpcFailureReasonCode,
-};
-
-/**
- * Redacted RPC failure annotated with its separated failure category, stable
- * reason code, and preserved retryability flag. The `cause` chain is kept for
- * in-process callers; only `message` is constructed from safe enum codes.
- */
-export class RpcClassifiedError extends Error {
-  readonly category: RpcFailureCategory;
-  readonly reasonCode: RpcFailureReasonCode;
-  readonly retryable: boolean;
-  readonly httpStatus: number | null;
-
-  constructor(classification: RpcFailureClassification, options?: ErrorOptions) {
-    super(classification.summary, options);
-    this.name = "RpcClassifiedError";
-    this.category = classification.category;
-    this.reasonCode = classification.reasonCode;
-    this.retryable = classification.retryable;
-    this.httpStatus = classification.httpStatus;
-  }
-
-  static from(err: unknown): RpcClassifiedError {
-    if (err instanceof RpcClassifiedError) return err;
-    return new RpcClassifiedError(classifyRpcFailure(err), err instanceof Error ? { cause: err } : undefined);
-  }
-}
-
-/**
- * Run an async RPC call and normalize any thrown failure into a redacted
- * {@link RpcClassifiedError}, keeping the original error as `cause`.
- */
-export async function withClassifiedRpcFailure<T>(fn: () => Promise<T>): Promise<T> {
-  try {
-    return await fn();
-  } catch (err) {
-    throw RpcClassifiedError.from(err);
-  }
-}
+import { assertRpcEndpointUrl } from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -82,31 +28,20 @@ export class RpcPassphraseError extends Error {
 }
 
 /**
- * Build RPC egress allowlist options from a {@link StellarConfig}.
- * Retains a credential-free loopback exception when `allowLoopbackRpc` is set
- * or when `MIMIR_PROFILE=mock` is active.
+ * Normalize a Soroban RPC URL into a bounded, secret-free endpoint key suitable
+ * for per-endpoint circuit-breaker state and logs. Strips credentials, query
+ * parameters, and fragments; falls back to `"default"` when empty or invalid.
  */
-export function rpcEgressOptionsForConfig(
-  config: Pick<StellarConfig, "rpcEgressAllowlist" | "allowLoopbackRpc">,
-): RpcEgressAllowlistOptions {
-  return {
-    allowlist: config.rpcEgressAllowlist,
-    allowLoopback: config.allowLoopbackRpc ?? process.env.MIMIR_PROFILE === "mock",
-  };
-}
-
-/**
- * Create an egress-guarded `fetch` function bound to `config`'s RPC allowlist
- * (validating both initial URLs and HTTP redirect destinations).
- */
-export function createRpcEgressFetch(
-  config: Pick<StellarConfig, "rpcEgressAllowlist" | "allowLoopbackRpc">,
-  fetchImpl?: typeof fetch,
-): typeof fetch {
-  return createEgressGuardedFetch({
-    ...rpcEgressOptionsForConfig(config),
-    fetchImpl,
-  });
+export function normalizeRpcEndpoint(rpcUrl: string): string {
+  const trimmed = typeof rpcUrl === "string" ? rpcUrl.trim() : "";
+  if (!trimmed) return "default";
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${pathname}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "").slice(0, 128) || "default";
+  }
 }
 
 /**
@@ -116,8 +51,8 @@ export function createRpcEgressFetch(
  * (retaining a credential-free loopback exception for mock mode).
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
-  const maxResponseBytes = config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
-  const server = new rpc.Server(config.rpcUrl, {
+  assertRpcEndpointUrl(config.rpcUrl, "STELLAR_RPC_URL");
+  return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,

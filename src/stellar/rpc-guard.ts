@@ -7,78 +7,88 @@
  */
 
 import type { rpc } from "@stellar/stellar-sdk";
+import { normalizeRpcEndpoint } from "./client.js";
 
 import { resolveMaxBackoffMs } from "./client.js";
 
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
 
-export type RpcNetworkIdentityProblem =
-  | "not-an-object"
-  | "malformed-passphrase"
-  | "passphrase-mismatch";
+export type RpcUrlProblem =
+  | "invalid-url"
+  | "unsupported-protocol"
+  | "embedded-credentials";
 
 /**
- * Error thrown when an RPC endpoint's `getNetwork` response fails network
- * identity validation.
+ * Error thrown when a configured RPC or endpoint URL fails boundary validation.
  *
- * Messages are strictly bounded and never echo configured or reported
- * passphrases.
+ * Messages are strictly bounded and report only the affected configuration key,
+ * never echoing the raw URL or any embedded credentials.
  */
-export class RpcNetworkIdentityError extends Error {
-  readonly problem: RpcNetworkIdentityProblem;
+export class RpcEndpointUrlError extends Error {
+  readonly problem: RpcUrlProblem;
+  readonly configKey: string;
 
-  constructor(problem: RpcNetworkIdentityProblem, message: string) {
+  constructor(problem: RpcUrlProblem, configKey: string, message: string) {
     super(message);
-    this.name = "RpcNetworkIdentityError";
+    this.name = "RpcEndpointUrlError";
     this.problem = problem;
+    this.configKey = configKey;
   }
 }
 
-export interface VerifiedNetworkIdentity {
-  passphrase: string;
-}
+/** Matches an authority section containing userinfo (`@` before path/query/hash). */
+const EMBEDDED_USERINFO_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i;
 
 /**
- * Validate a `getNetwork` RPC response against the configured network passphrase.
+ * Validate a configured HTTP(S) endpoint URL before startup or client creation.
  *
- * Rejects non-object payloads, missing or non-string passphrases, and endpoints
- * reporting a different network passphrase than configured. Error messages are
- * bounded and never echo the raw passphrases.
+ * Rejects malformed URLs, non-HTTP(S) protocols, and URLs with embedded
+ * credentials (`user:pass@host`, `user@host`, `:pass@host`, or `@host`).
+ * Errors report only the affected configuration key and never echo the URL or
+ * credentials.
  *
- * @param value The raw `getNetwork` response value to validate.
- * @param expectedPassphrase The configured Stellar network passphrase.
- * @returns The verified network identity.
- * @throws {RpcNetworkIdentityError} When the response is malformed or serves another network.
+ * @param url The configured URL string to validate.
+ * @param configKey Configuration key name reported in errors (defaults to `"STELLAR_RPC_URL"`).
+ * @returns The validated URL string.
+ * @throws {RpcEndpointUrlError} When the URL is invalid, non-HTTP(S), or contains embedded credentials.
  */
-export function assertNetworkIdentity(
-  value: unknown,
-  expectedPassphrase: string,
-): VerifiedNetworkIdentity {
-  if (!isRecord(value)) {
-    throw new RpcNetworkIdentityError(
-      "not-an-object",
-      `RPC getNetwork response must be an object; got ${value === null ? "null" : typeof value}`,
+export function assertRpcEndpointUrl(
+  url: string,
+  configKey = "STELLAR_RPC_URL",
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new RpcEndpointUrlError(
+      "invalid-url",
+      configKey,
+      `${configKey} is not a valid URL`,
     );
   }
 
-  const rpcPassphrase = value.passphrase;
-  if (typeof rpcPassphrase !== "string") {
-    throw new RpcNetworkIdentityError(
-      "malformed-passphrase",
-      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new RpcEndpointUrlError(
+      "unsupported-protocol",
+      configKey,
+      `${configKey} must be an http(s) URL`,
     );
   }
 
-  if (rpcPassphrase !== expectedPassphrase) {
-    throw new RpcNetworkIdentityError(
-      "passphrase-mismatch",
-      `RPC network passphrase does not match the configured value ` +
-        `(configured=${expectedPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
+  if (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    EMBEDDED_USERINFO_RE.test(url.trim())
+  ) {
+    throw new RpcEndpointUrlError(
+      "embedded-credentials",
+      configKey,
+      `${configKey} must not contain embedded credentials`,
     );
   }
 
-  return { passphrase: rpcPassphrase };
+  return url;
 }
 
 export type RpcGuardProblem =
@@ -211,305 +221,258 @@ export function assertEventsResponse(
   return value as unknown as rpc.Api.GetEventsResponse;
 }
 
-/** The transport/protocol layer an RPC failure originated from. */
-export type RpcFailureCategory = "dns" | "tls" | "http" | "timeout" | "transport";
+// ── Endpoint-specific half-open circuit breaker ──────────────────────────────
 
-/** Stable, redacted reason codes; never derived from untrusted error text. */
-export type RpcFailureReasonCode =
-  | "dns_not_found"
-  | "dns_temp_failure"
-  | "dns_lookup_failed"
-  | "tls_cert_expired"
-  | "tls_cert_untrusted"
-  | "tls_hostname_mismatch"
-  | "tls_handshake_timeout"
-  | "tls_protocol_error"
-  | "http_rate_limited"
-  | "http_request_timeout"
-  | "http_unauthorized"
-  | "http_not_found"
-  | "http_client_error"
-  | "http_server_error"
-  | "http_unexpected_status"
-  | "request_timeout"
-  | "connection_refused"
-  | "connection_reset"
-  | "network_unreachable"
-  | "transport_error";
+/** Default number of consecutive RPC failures before opening an endpoint circuit. */
+export const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
+
+/** Default cooldown period in milliseconds before allowing a half-open probe. */
+export const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
+
+/** Default maximum concurrent recovery probes allowed while half-open. */
+export const DEFAULT_HALF_OPEN_MAX_PROBES = 1;
+
+/** Lifecycle state of an endpoint-specific RPC circuit breaker. */
+export type CircuitBreakerState = "closed" | "open" | "half-open";
+
+export interface RpcCircuitBreakerOptions {
+  /** Consecutive failures required to open the circuit. Defaults to 5. */
+  failureThreshold?: number;
+  /** Cooldown in milliseconds before transitioning from open to half-open. Defaults to 60_000. */
+  cooldownMs?: number;
+  /** Maximum bounded probes allowed in half-open state. Defaults to 1. */
+  maxHalfOpenProbes?: number;
+  /** Clock source in unix ms (injectable for deterministic tests). */
+  now?: () => number;
+}
+
+export interface CircuitProbeDecision {
+  /** Whether the caller may issue an RPC request to this endpoint. */
+  allowed: boolean;
+  /** Current circuit state after evaluating the request. */
+  state: CircuitBreakerState;
+  /** True when this request was admitted as a bounded half-open recovery probe. */
+  isProbe: boolean;
+  /** Normalized endpoint key this decision applies to. */
+  endpoint: string;
+  /** Remaining cooldown in ms when rejected in open state; 0 otherwise. */
+  remainingCooldownMs: number;
+}
+
+export interface EndpointCircuitSnapshot {
+  endpoint: string;
+  state: CircuitBreakerState;
+  /** Backward-compatible flag: true only when state is `"open"`. */
+  open: boolean;
+  /** True when state is `"half-open"`. */
+  halfOpen: boolean;
+  openedAt: number | null;
+  failureCount: number;
+  lastFailureAt: number | null;
+  probesInFlight: number;
+}
+
+interface EndpointCircuitRecord {
+  state: CircuitBreakerState;
+  openedAt: number | null;
+  failureCount: number;
+  lastFailureAt: number | null;
+  probesInFlight: number;
+}
 
 /**
- * Result of classifying an RPC failure. `summary` is built only from the
- * category, reason code, and numeric HTTP status, so it is safe for logs,
- * `/status`, and operator messages without further redaction.
+ * Endpoint-specific RPC circuit breaker with bounded half-open recovery probes.
+ *
+ * Each normalized RPC endpoint tracks its own closed / open / half-open state
+ * so a degraded endpoint cannot trip or starve another endpoint. After
+ * cooldown elapses, the breaker admits at most `maxHalfOpenProbes` (default 1)
+ * bounded probe instead of exposing the recovering endpoint to full poller
+ * load. A successful probe closes the circuit; a failed probe immediately
+ * re-opens it for a fresh cooldown.
  */
-export interface RpcFailureClassification {
-  readonly category: RpcFailureCategory;
-  readonly reasonCode: RpcFailureReasonCode;
-  readonly retryable: boolean;
-  readonly httpStatus: number | null;
-  readonly summary: string;
-}
+export class RpcCircuitBreaker {
+  readonly failureThreshold: number;
+  readonly cooldownMs: number;
+  readonly maxHalfOpenProbes: number;
+  private readonly now: () => number;
+  private readonly endpoints = new Map<string, EndpointCircuitRecord>();
 
-const MAX_ERROR_CAUSE_DEPTH = 8;
-
-const DNS_NOT_FOUND_CODES = new Set(["ENOTFOUND", "EAI_NONAME", "EAI_NODATA"]);
-const DNS_TEMP_CODES = new Set(["EAI_AGAIN"]);
-const DNS_OTHER_CODES = new Set([
-  "EAI_FAIL",
-  "EAI_BADFLAGS",
-  "EAI_FAMILY",
-  "EAI_MEMORY",
-  "EAI_SERVICE",
-  "EAI_SOCKTYPE",
-]);
-
-const TLS_EXPIRED_CODES = new Set([
-  "CERT_HAS_EXPIRED",
-  "CERT_NOT_YET_VALID",
-  "ERR_TLS_CERT_EXPIRED",
-]);
-const TLS_UNTRUSTED_CODES = new Set([
-  "DEPTH_ZERO_SELF_SIGNED_CERT",
-  "SELF_SIGNED_CERT_IN_CHAIN",
-  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
-  "UNABLE_TO_GET_ISSUER_CERT",
-  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
-  "CERT_UNTRUSTED",
-  "CERT_REVOKED",
-  "CERT_CHAIN_TOO_LONG",
-  "CERT_SIGNATURE_FAILURE",
-  "INVALID_CA",
-]);
-const TLS_HOSTNAME_CODES = new Set([
-  "ERR_TLS_CERT_ALTNAME_INVALID",
-  "ERR_TLS_CERT_ALTNAME_FORMAT",
-  "HOSTNAME_MISMATCH",
-]);
-const TLS_TIMEOUT_CODES = new Set(["ERR_TLS_HANDSHAKE_TIMEOUT"]);
-
-const TIMEOUT_CODES = new Set([
-  "ETIMEDOUT",
-  "ESOCKETTIMEDOUT",
-  "UND_ERR_CONNECT_TIMEOUT",
-  "UND_ERR_HEADERS_TIMEOUT",
-  "UND_ERR_BODY_TIMEOUT",
-  "ABORT_ERR",
-]);
-const CONN_REFUSED_CODES = new Set(["ECONNREFUSED"]);
-const CONN_RESET_CODES = new Set([
-  "ECONNRESET",
-  "EPIPE",
-  "ECONNABORTED",
-  "UND_ERR_SOCKET",
-  "UND_ERR_CLOSED",
-]);
-const NET_UNREACHABLE_CODES = new Set([
-  "ENETUNREACH",
-  "EHOSTUNREACH",
-  "ENETDOWN",
-  "EHOSTDOWN",
-]);
-
-function buildFailureResult(
-  category: RpcFailureCategory,
-  reasonCode: RpcFailureReasonCode,
-  retryable: boolean,
-  httpStatus: number | null = null,
-): RpcFailureClassification {
-  return {
-    category,
-    reasonCode,
-    retryable,
-    httpStatus,
-    summary:
-      category === "http" && httpStatus !== null
-        ? `RPC HTTP ${httpStatus} failure (${reasonCode})`
-        : `RPC ${category.toUpperCase()} failure (${reasonCode})`,
-  };
-}
-
-function classifyHttpStatus(status: number): RpcFailureClassification {
-  if (status === 429) return buildFailureResult("http", "http_rate_limited", true, status);
-  if (status === 408) return buildFailureResult("http", "http_request_timeout", true, status);
-  if (status === 401 || status === 403) {
-    return buildFailureResult("http", "http_unauthorized", false, status);
+  constructor(options: RpcCircuitBreakerOptions = {}) {
+    const threshold = options.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
+    this.failureThreshold = Number.isFinite(threshold) ? Math.max(1, Math.floor(threshold)) : threshold;
+    const cooldown = options.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
+    this.cooldownMs = Math.max(0, Number.isFinite(cooldown) ? cooldown : DEFAULT_CIRCUIT_COOLDOWN_MS);
+    const maxProbes = options.maxHalfOpenProbes ?? DEFAULT_HALF_OPEN_MAX_PROBES;
+    this.maxHalfOpenProbes = Math.max(1, Number.isFinite(maxProbes) ? Math.floor(maxProbes) : 1);
+    this.now = options.now ?? (() => Date.now());
   }
-  if (status === 404 || status === 410) {
-    return buildFailureResult("http", "http_not_found", false, status);
-  }
-  if (status >= 400 && status <= 499) {
-    return buildFailureResult("http", "http_client_error", false, status);
-  }
-  if (status >= 500 && status <= 599) {
-    return buildFailureResult("http", "http_server_error", true, status);
-  }
-  return buildFailureResult("http", "http_unexpected_status", false, status);
-}
 
-function extractHttpStatusCandidate(node: Record<string, unknown>): number | null {
-  const response = isRecord(node.response) ? node.response : null;
-  const candidates = [response?.status, response?.statusCode, node.status, node.statusCode];
-  for (const candidate of candidates) {
-    if (
-      typeof candidate === "number" &&
-      Number.isInteger(candidate) &&
-      candidate >= 100 &&
-      candidate <= 599
-    ) {
-      return candidate;
+  private getOrCreate(endpoint: string): { key: string; record: EndpointCircuitRecord } {
+    const key = normalizeRpcEndpoint(endpoint);
+    let record = this.endpoints.get(key);
+    if (!record) {
+      record = {
+        state: "closed",
+        openedAt: null,
+        failureCount: 0,
+        lastFailureAt: null,
+        probesInFlight: 0,
+      };
+      this.endpoints.set(key, record);
     }
-  }
-  return null;
-}
-
-function classifyErrorCode(
-  rawCode: string,
-  syscall: string,
-): RpcFailureClassification | null {
-  const code = rawCode.trim().toUpperCase();
-  if (!code) return null;
-
-  if (DNS_NOT_FOUND_CODES.has(code)) return buildFailureResult("dns", "dns_not_found", false);
-  if (DNS_TEMP_CODES.has(code)) return buildFailureResult("dns", "dns_temp_failure", true);
-  if (DNS_OTHER_CODES.has(code) || code.startsWith("ERR_DNS_") || syscall === "getaddrinfo") {
-    return buildFailureResult("dns", "dns_lookup_failed", true);
+    return { key, record };
   }
 
-  if (TLS_EXPIRED_CODES.has(code)) return buildFailureResult("tls", "tls_cert_expired", false);
-  if (TLS_UNTRUSTED_CODES.has(code)) return buildFailureResult("tls", "tls_cert_untrusted", false);
-  if (TLS_HOSTNAME_CODES.has(code)) {
-    return buildFailureResult("tls", "tls_hostname_mismatch", false);
-  }
-  if (TLS_TIMEOUT_CODES.has(code)) {
-    return buildFailureResult("tls", "tls_handshake_timeout", true);
-  }
-  if (
-    code === "EPROTO" ||
-    code.startsWith("ERR_TLS_") ||
-    code.startsWith("ERR_SSL_") ||
-    code.startsWith("SSL_")
-  ) {
-    return buildFailureResult("tls", "tls_protocol_error", false);
+  private toSnapshot(key: string, record: EndpointCircuitRecord): EndpointCircuitSnapshot {
+    return {
+      endpoint: key,
+      state: record.state,
+      open: record.state === "open",
+      halfOpen: record.state === "half-open",
+      openedAt: record.openedAt,
+      failureCount: record.failureCount,
+      lastFailureAt: record.lastFailureAt,
+      probesInFlight: record.probesInFlight,
+    };
   }
 
-  if (TIMEOUT_CODES.has(code)) return buildFailureResult("timeout", "request_timeout", true);
-  if (CONN_REFUSED_CODES.has(code)) {
-    return buildFailureResult("transport", "connection_refused", true);
-  }
-  if (CONN_RESET_CODES.has(code)) return buildFailureResult("transport", "connection_reset", true);
-  if (NET_UNREACHABLE_CODES.has(code)) {
-    return buildFailureResult("transport", "network_unreachable", true);
-  }
-  return null;
-}
+  /**
+   * Decide whether a request to `endpoint` is permitted.
+   *
+   * - `closed`: allowed (`isProbe: false`).
+   * - `open`: rejected while within cooldown; once cooldown elapses, transitions
+   *   to `half-open` and admits one bounded recovery probe (`isProbe: true`).
+   * - `half-open`: admits up to `maxHalfOpenProbes` concurrent probes; rejects
+   *   additional requests so the recovering endpoint does not receive full load.
+   */
+  allowRequest(endpoint: string): CircuitProbeDecision {
+    const { key, record } = this.getOrCreate(endpoint);
 
-function unwrapErrorChain(root: unknown): Record<string, unknown>[] {
-  const nodes: Record<string, unknown>[] = [];
-  const seen = new Set<unknown>();
-  const queue: unknown[] = [root];
+    if (record.state === "closed") {
+      return {
+        allowed: true,
+        state: "closed",
+        isProbe: false,
+        endpoint: key,
+        remainingCooldownMs: 0,
+      };
+    }
 
-  while (queue.length > 0 && nodes.length < MAX_ERROR_CAUSE_DEPTH) {
-    const current = queue.shift();
-    if (current === null || typeof current !== "object" || seen.has(current)) continue;
-    seen.add(current);
-
-    const record = current as Record<string, unknown>;
-    nodes.push(record);
-
-    if (isRecord(record.cause)) queue.push(record.cause);
-    if (Array.isArray(record.errors)) {
-      for (const nested of record.errors) {
-        if (nested !== null && typeof nested === "object") queue.push(nested);
+    if (record.state === "open") {
+      const nowMs = this.now();
+      const elapsed = record.openedAt !== null ? Math.max(0, nowMs - record.openedAt) : Infinity;
+      if (elapsed >= this.cooldownMs) {
+        record.state = "half-open";
+        record.probesInFlight = 1;
+        return {
+          allowed: true,
+          state: "half-open",
+          isProbe: true,
+          endpoint: key,
+          remainingCooldownMs: 0,
+        };
       }
+      return {
+        allowed: false,
+        state: "open",
+        isProbe: false,
+        endpoint: key,
+        remainingCooldownMs: Math.max(0, this.cooldownMs - elapsed),
+      };
     }
-  }
-  return nodes;
-}
 
-/**
- * Classify an RPC error into a separated category with a stable redacted
- * reason code and the retryability decision for that failure mode. Ordinary
- * misconfigurations are non-retryable; transient outages stay retryable.
- * Untrusted message text is only pattern-matched, never copied into the result.
- */
-export function classifyRpcFailure(err: unknown): RpcFailureClassification {
-  const chain = unwrapErrorChain(err);
-
-  for (const node of chain) {
-    const status = extractHttpStatusCandidate(node);
-    if (status !== null) return classifyHttpStatus(status);
-  }
-
-  for (const node of chain) {
-    const code = typeof node.code === "string" ? node.code : "";
-    const syscall = typeof node.syscall === "string" ? node.syscall.toLowerCase() : "";
-    const byCode = classifyErrorCode(code, syscall);
-    if (byCode !== null) return byCode;
-    if (node.name === "TimeoutError") {
-      return buildFailureResult("timeout", "request_timeout", true);
+    // half-open
+    if (record.probesInFlight < this.maxHalfOpenProbes) {
+      record.probesInFlight += 1;
+      return {
+        allowed: true,
+        state: "half-open",
+        isProbe: true,
+        endpoint: key,
+        remainingCooldownMs: 0,
+      };
     }
-  }
 
-  const messages: string[] = [];
-  if (typeof err === "string") messages.push(err);
-  for (const node of chain) {
-    if (typeof node.message === "string") messages.push(node.message);
+    return {
+      allowed: false,
+      state: "half-open",
+      isProbe: false,
+      endpoint: key,
+      remainingCooldownMs: 0,
+    };
   }
 
-  for (const message of messages) {
-    const statusMatch = /\bstatus code (\d{3})\b/i.exec(message) ?? /\bHTTP (\d{3})\b/i.exec(message);
-    if (statusMatch?.[1]) {
-      const status = Number(statusMatch[1]);
-      if (status >= 100 && status <= 599) return classifyHttpStatus(status);
-    }
-
-    if (/\b(?:ENOTFOUND|EAI_NONAME|EAI_NODATA)\b/i.test(message)) {
-      return buildFailureResult("dns", "dns_not_found", false);
-    }
-    if (/\bEAI_AGAIN\b/i.test(message)) {
-      return buildFailureResult("dns", "dns_temp_failure", true);
-    }
-    if (/\bgetaddrinfo\b/i.test(message)) {
-      return buildFailureResult("dns", "dns_lookup_failed", true);
-    }
-
-    if (/\b(?:CERT_HAS_EXPIRED|CERT_NOT_YET_VALID|certificate has expired)\b/i.test(message)) {
-      return buildFailureResult("tls", "tls_cert_expired", false);
-    }
-    if (
-      /\b(?:SELF_SIGNED_CERT_IN_CHAIN|DEPTH_ZERO_SELF_SIGNED_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE|self[- ]signed certificate)\b/i.test(
-        message,
-      )
-    ) {
-      return buildFailureResult("tls", "tls_cert_untrusted", false);
-    }
-    if (/\b(?:ERR_TLS_CERT_ALTNAME_INVALID|Hostname\/IP does not match certificate)\b/i.test(message)) {
-      return buildFailureResult("tls", "tls_hostname_mismatch", false);
-    }
-    if (/\b(?:SSL routines|TLS alert|ERR_TLS_|ERR_SSL_|EPROTO)\b/i.test(message)) {
-      return buildFailureResult("tls", "tls_protocol_error", false);
-    }
-
-    if (/\b(?:ETIMEDOUT|timed? ?out)\b/i.test(message)) {
-      return buildFailureResult("timeout", "request_timeout", true);
-    }
-    if (/\bECONNREFUSED\b/i.test(message)) {
-      return buildFailureResult("transport", "connection_refused", true);
-    }
-    if (/\b(?:ECONNRESET|EPIPE|socket hang up)\b/i.test(message)) {
-      return buildFailureResult("transport", "connection_reset", true);
-    }
+  /** Record a successful RPC call for `endpoint`, closing any half-open circuit. */
+  recordSuccess(endpoint: string): EndpointCircuitSnapshot {
+    const { key, record } = this.getOrCreate(endpoint);
+    record.state = "closed";
+    record.openedAt = null;
+    record.failureCount = 0;
+    record.lastFailureAt = null;
+    record.probesInFlight = 0;
+    return this.toSnapshot(key, record);
   }
 
-  return buildFailureResult("transport", "transport_error", true);
-}
+  /**
+   * Record one or more RPC failures for `endpoint`.
+   *
+   * In `half-open`, a single failure immediately re-opens the circuit for a
+   * fresh cooldown. In `closed`, the circuit opens once `failureCount` reaches
+   * `failureThreshold`.
+   */
+  recordFailure(endpoint: string, count = 1): EndpointCircuitSnapshot {
+    const { key, record } = this.getOrCreate(endpoint);
+    const increment = Math.max(1, Math.floor(count));
+    const nowMs = this.now();
+    record.failureCount += increment;
+    record.lastFailureAt = nowMs;
 
-/** True when {@link classifyRpcFailure} marks the failure as retryable. */
-export function isRetryableRpcFailure(err: unknown): boolean {
-  return classifyRpcFailure(err).retryable;
-}
+    if (record.state === "half-open") {
+      record.state = "open";
+      record.openedAt = nowMs;
+      record.probesInFlight = 0;
+    } else if (record.state === "closed" && record.failureCount >= this.failureThreshold) {
+      record.state = "open";
+      record.openedAt = nowMs;
+      record.probesInFlight = 0;
+    }
 
-/** Return the fixed, secret-free summary for an RPC failure. */
-export function formatClassifiedRpcFailure(err: unknown): string {
-  return classifyRpcFailure(err).summary;
+    return this.toSnapshot(key, record);
+  }
+
+  /**
+   * Release a previously admitted half-open probe slot without recording a
+   * success or failure (e.g. when no target was eligible to send an RPC).
+   */
+  releaseProbe(endpoint: string): EndpointCircuitSnapshot {
+    const { key, record } = this.getOrCreate(endpoint);
+    if (record.state === "half-open" && record.probesInFlight > 0) {
+      record.probesInFlight -= 1;
+    }
+    return this.toSnapshot(key, record);
+  }
+
+  /** Return a snapshot of the circuit state for `endpoint`. */
+  snapshot(endpoint: string): EndpointCircuitSnapshot {
+    const { key, record } = this.getOrCreate(endpoint);
+    return this.toSnapshot(key, record);
+  }
+
+  /** Return snapshots for all tracked endpoints. */
+  snapshots(): Record<string, EndpointCircuitSnapshot> {
+    const result: Record<string, EndpointCircuitSnapshot> = {};
+    for (const [key, record] of this.endpoints.entries()) {
+      result[key] = this.toSnapshot(key, record);
+    }
+    return result;
+  }
+
+  /** Reset one endpoint (or all endpoints when omitted) to a clean closed state. */
+  reset(endpoint?: string): void {
+    if (endpoint === undefined) {
+      this.endpoints.clear();
+      return;
+    }
+    this.endpoints.delete(normalizeRpcEndpoint(endpoint));
+  }
 }
