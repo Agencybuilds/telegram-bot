@@ -17,14 +17,7 @@ import {
   type CursorConsistencyReport,
 } from "./cursor-consistency.js";
 import { acquireInstanceLock } from "./instanceLock.js";
-import { readArchive } from "./stellar/archive.js";
-import {
-  appendCursorRecoveryHistory,
-  parseAndMigrateCursorFile,
-  snapshotCursorPositions,
-  type CursorRecoveryPosition,
-  type CursorRecoveryRecord,
-} from "./poller.js";
+import { DuplicateCursorTargetError, parseAndMigrateCursorFile } from "./poller.js";
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -131,19 +124,11 @@ export async function assertDifferentPaths(left: string, right: string): Promise
 function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFile> {
   try {
     return parseAndMigrateCursorFile(raw);
-  } catch {
-    throw new CursorDiagnosticError(
-      "CURSOR_CORRUPT_JSON",
-      `cursor file at "${filePath}" is malformed JSON or uses an unsupported schema`,
-    );
-  }
-}
-
-async function readCursorText(filePath: string): Promise<string> {
-  try {
-    return await readFile(filePath, "utf8");
   } catch (err) {
-    throw toCursorFsDiagnostic(err, filePath, "reading");
+    if (err instanceof DuplicateCursorTargetError) {
+      throw err;
+    }
+    throw new Error("cursor file is malformed or uses an unsupported schema");
   }
 }
 
