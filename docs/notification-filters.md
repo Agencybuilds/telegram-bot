@@ -168,12 +168,50 @@ NOTIFY_CATEGORIES=__none__
 
 ---
 
-## 4. Atomic Filter Configuration Reloads
+## 4. Per-Route Notification Filter Overrides
 
-For programmatic filter sets combining typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and integer USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)), [`src/notifications/filter-reload.ts`](../src/notifications/filter-reload.ts) provides atomic configuration reloads:
+For multi-route deployments that combine typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)), [`src/notifications/route-filters.ts`](../src/notifications/route-filters.ts) provides per-route filter overrides via `compileRouteFilters(config, options?)`.
 
-- **`compileFilterConfig(candidate, version?)`**: Validates the entire candidate configuration (every expression in `expressions` and every threshold in `thresholds`) upfront and returns a frozen `CompiledFilterSet`. If any field is invalid, it throws `FilterConfigValidationError` with all collected `issues`—partial configurations are never produced.
-- **`AtomicFilterReloader`**:
-  - `reload(candidate)` compiles and validates the full candidate before performing a single atomic reference swap to the new `CompiledFilterSet`. On failure, it returns `{ ok: false, applied: false, error, filterSet }` and retains the previous working filter set unchanged (version does not increment).
-  - `reloadOrThrow(candidate)` performs the same atomic swap and throws `FilterConfigValidationError` on failure while retaining the previous working filter set.
-  - `matches(event)` evaluates an event against the active immutable snapshot via `evaluateFilterSet` (requires `meetsThreshold` and, when `rules` is non-empty, at least one matching `FilterRule`).
+Equivalent decimal USDC thresholds (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) are normalized identically to 7-decimal atomic units before comparison in `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (including explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`). Values exceeding seven fractional digits (such as `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
+
+### 4.1 Precedence Rules
+
+When `registry.evaluate(routeId, event)` runs for a route:
+
+1. **Invalid override isolation**: If the route's override failed validation at compile time, it is isolated in `registry.invalidRoutes` and never affects other routes or the global policy.
+   - Under the default `invalidRouteFallback: "global"`, the affected route falls back to the compiled global policy (`overrideStatus: "invalid_fallback_global"`).
+   - Under `invalidRouteFallback: "deny"`, the affected route fails closed (`allowed: false`, `reason: "invalid_override_denied"`).
+2. **Route kill switch (`enabled: false`)**: Suppresses all events for that route regardless of global rules (`reason: "route_disabled"`).
+3. **Effective thresholds**:
+   - `mode: "merge"` *(default)*: Route threshold fields (`marketChallenge`, `squadDeposit`) override the corresponding global threshold fields when explicitly set (including `"0"` / `0n` to disable a global threshold for that route). Unspecified fields inherit from the global policy.
+   - `mode: "replace"`: Route thresholds completely replace global thresholds for that route.
+4. **Effective filter expressions**:
+   - `mode: "merge"` *(default)*: Global expressions (if non-empty) **and** route expressions (if non-empty) must both match. Within a single expression list, matching any rule satisfies that list (OR semantics).
+   - `mode: "replace"`: Route expressions completely replace global expressions for that route.
+
+### 4.2 Example Configuration
+
+```ts
+import { compileRouteFilters } from "./notifications/route-filters.js";
+
+const registry = compileRouteFilters({
+  global: {
+    thresholds: { marketChallenge: "20", squadDeposit: "50" },
+    expressions: ["claim_challenged", "deposited", "claim_created where category == 'crypto'"],
+  },
+  routes: {
+    "whale-chat": {
+      // mode: "merge" (default) — raises marketChallenge to 100 USDC, inherits squadDeposit = 50 USDC
+      thresholds: { marketChallenge: "100" },
+    },
+    "firehose": {
+      // mode: "replace" — ignores global thresholds and expressions for this route
+      mode: "replace",
+    },
+    "muted-chat": {
+      enabled: false,
+    },
+  },
+});
+```
+
