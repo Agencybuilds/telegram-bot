@@ -149,6 +149,8 @@ export interface ReplayReport {
     resumedSkippedEvents?: number | undefined;
     failedSends?: number | undefined;
   };
+  /** Deterministic completeness certificate across all requested targets. */
+  certificate: ReplayCompletenessCertificate;
 }
 
 // ── Progress / Checkpoint schema ─────────────────────────────────────────────
@@ -183,8 +185,11 @@ export interface ReplayProgressTarget {
   completed: boolean;
   budgetExhausted?: boolean | undefined;
   failedSends?: number | undefined;
-  lastCommittedOutputEventId?: string | null | undefined;
-  committedOutputRecords?: number | undefined;
+  observedFromLedger?: number | null | undefined;
+  observedToLedger?: number | null | undefined;
+  retainedFloorLedger?: number | null | undefined;
+  chainTipLedger?: number | null | undefined;
+  startClamped?: boolean | undefined;
 }
 
 export interface ReplayProgressFile {
@@ -302,14 +307,8 @@ export interface ReplayOptions {
   show?: number | undefined;
   /** Path to an optional progress/checkpoint file. */
   progressFile?: string | undefined;
-  /** Path to an optional JSONL output file for committed event records. */
-  outputFile?: string | undefined;
-  /** Event IDs already committed in an existing output file (to avoid duplicates on resume). */
-  committedOutputIds?: ReadonlySet<string> | undefined;
-  /** Initial count of committed output records for this target. */
-  initialCommittedOutputCount?: number | undefined;
-  /** Initial last committed output event ID for this target. */
-  initialLastCommittedOutputEventId?: string | null | undefined;
+  /** Path to an optional deterministic completeness certificate file. */
+  certificateFile?: string | undefined;
   /** Maximum RPC requests per minute. */
   rpm?: number | undefined;
   /** Maximum events to process in this run across targets. */
@@ -355,7 +354,7 @@ export interface ReplayDeps {
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-export async function writeProgressFileAtomic(filePath: string, data: ReplayProgressFile): Promise<void> {
+async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
@@ -368,136 +367,187 @@ export async function writeProgressFileAtomic(filePath: string, data: ReplayProg
   }
 }
 
-export interface PreparedReplayOutput {
-  committedEventIds: Set<string>;
-  committedEventIdsBySource: Partial<Record<ContractSource, Set<string>>>;
-  lastCommittedEventId: string | null;
-  lastCommittedEventIdBySource: Partial<Record<ContractSource, string>>;
-  committedCount: number;
-  committedCountBySource: Partial<Record<ContractSource, number>>;
-  trimmedTrailingBytes: number;
+export async function writeProgressFileAtomic(filePath: string, data: ReplayProgressFile): Promise<void> {
+  await writeJsonAtomic(filePath, data);
 }
 
-/**
- * Inspect an existing replay output JSONL file before resuming:
- * - Preserves all fully committed newline-terminated JSON records without truncating them.
- * - Trims any incomplete or corrupt trailing fragment left by an interrupted write.
- * - Rejects corrupt records in the middle of the file.
- */
-export async function prepareReplayOutputFile(filePath: string): Promise<PreparedReplayOutput> {
-  const committedEventIds = new Set<string>();
-  const committedEventIdsBySource: Partial<Record<ContractSource, Set<string>>> = {};
-  const lastCommittedEventIdBySource: Partial<Record<ContractSource, string>> = {};
-  const committedCountBySource: Partial<Record<ContractSource, number>> = {};
-  let lastCommittedEventId: string | null = null;
-  let committedCount = 0;
+export async function writeCertificateFileAtomic(
+  filePath: string,
+  data: ReplayCompletenessCertificate,
+): Promise<void> {
+  await writeJsonAtomic(filePath, data);
+}
 
-  let buf: Buffer;
-  try {
-    buf = await readFile(filePath);
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      await mkdir(path.dirname(filePath), { recursive: true });
-      return {
-        committedEventIds,
-        committedEventIdsBySource,
-        lastCommittedEventId,
-        lastCommittedEventIdBySource,
-        committedCount,
-        committedCountBySource,
-        trimmedTrailingBytes: 0,
-      };
-    }
-    throw new Error(`cannot read output file "${filePath}": ${err instanceof Error ? err.message : String(err)}`);
+export function parseRequestedFromLedger(from: string | number): number | null {
+  if (typeof from === "number") {
+    return Number.isFinite(from) && from >= 1 ? from : null;
+  }
+  const trimmed = from.trim();
+  if (/^\d+-\d+$/.test(trimmed)) {
+    return eventCursorLedger(trimmed);
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const n = parseInt(trimmed, 10);
+    return Number.isFinite(n) && n >= 1 ? n : null;
+  }
+  return null;
+}
+
+export function buildTargetCertificate(params: {
+  source: ContractSource;
+  contractId: string;
+  requestedFrom: string | number;
+  requestedTo: number | null;
+  observedFromLedger: number | null;
+  observedToLedger: number | null;
+  retainedFloorLedger: number | null;
+  chainTipLedger: number | null;
+  startClamped: boolean;
+  truncated: boolean;
+  pages: number;
+  scanError?: string | undefined;
+}): ReplayTargetCertificate {
+  const requestedFromLedger = parseRequestedFromLedger(params.requestedFrom);
+  const requestedRange: ReplayTargetRange = {
+    from: normalizeRangeFrom(params.requestedFrom),
+    fromLedger: requestedFromLedger,
+    toLedger: params.requestedTo,
+  };
+  const observedRange: ReplayObservedRange = {
+    fromLedger: params.observedFromLedger,
+    toLedger: params.observedToLedger,
+  };
+
+  const gaps: ReplayCompletenessGap[] = [];
+
+  if (params.scanError) {
+    gaps.push({
+      source: params.source,
+      kind: "scan-error",
+      fromLedger: requestedFromLedger,
+      toLedger: params.requestedTo,
+      reason: `scan failed: ${params.scanError}`,
+    });
   }
 
-  let validEndOffset = 0;
-  let lineStart = 0;
-  let lineNumber = 0;
+  const pruned =
+    params.startClamped ||
+    (requestedFromLedger !== null &&
+      params.retainedFloorLedger !== null &&
+      requestedFromLedger < params.retainedFloorLedger);
 
-  while (lineStart < buf.length) {
-    const newlineIdx = buf.indexOf(0x0a, lineStart);
-    if (newlineIdx === -1) {
-      // Unterminated trailing fragment from an interrupted write.
-      break;
-    }
-
-    lineNumber += 1;
-    const rawLine = buf.subarray(lineStart, newlineIdx).toString("utf8").replace(/\r$/, "");
-    const nextStart = newlineIdx + 1;
-
-    if (rawLine.trim().length === 0) {
-      validEndOffset = nextStart;
-      lineStart = nextStart;
-      continue;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawLine);
-    } catch (err: unknown) {
-      // If this is the final line in the file, treat it as an interrupted write and trim it.
-      if (nextStart >= buf.length) {
-        break;
-      }
-      throw new Error(
-        `corrupt output record at line ${lineNumber} in "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-
-    if (!parsed || typeof parsed !== "object" || typeof (parsed as { eventId?: unknown }).eventId !== "string") {
-      if (nextStart >= buf.length) {
-        break;
-      }
-      throw new Error(`invalid output record schema at line ${lineNumber} in "${filePath}"`);
-    }
-
-    const rec = parsed as Partial<ReplayOutputRecord>;
-    const eventId = rec.eventId as string;
-    committedEventIds.add(eventId);
-    lastCommittedEventId = eventId;
-    committedCount += 1;
-
-    if (rec.source === "market" || rec.source === "squad") {
-      let set = committedEventIdsBySource[rec.source];
-      if (!set) {
-        set = new Set<string>();
-        committedEventIdsBySource[rec.source] = set;
-      }
-      set.add(eventId);
-      lastCommittedEventIdBySource[rec.source] = eventId;
-      committedCountBySource[rec.source] = (committedCountBySource[rec.source] ?? 0) + 1;
-    }
-
-    validEndOffset = nextStart;
-    lineStart = nextStart;
+  if (pruned && requestedFromLedger !== null && params.retainedFloorLedger !== null) {
+    gaps.push({
+      source: params.source,
+      kind: "pruned-history",
+      fromLedger: requestedFromLedger,
+      toLedger: Math.max(requestedFromLedger, params.retainedFloorLedger - 1),
+      reason: `requested start ledger ${requestedFromLedger} is below RPC retained floor ${params.retainedFloorLedger}`,
+    });
   }
 
-  const trimmedTrailingBytes = buf.length - validEndOffset;
-  if (trimmedTrailingBytes > 0) {
-    await truncate(filePath, validEndOffset);
+  const effectiveTargetTo =
+    params.requestedTo !== null && params.chainTipLedger !== null
+      ? Math.min(params.requestedTo, params.chainTipLedger)
+      : (params.requestedTo ?? params.chainTipLedger);
+
+  if (params.truncated && !params.scanError) {
+    const gapStart =
+      params.observedToLedger !== null
+        ? params.observedToLedger + 1
+        : params.observedFromLedger;
+    gaps.push({
+      source: params.source,
+      kind: "truncated-pages",
+      fromLedger: gapStart,
+      toLedger: effectiveTargetTo,
+      reason: `walk stopped after ${params.pages} page(s) before reaching ${effectiveTargetTo ?? "chain tip"}`,
+    });
   }
+
+  const beyondTip =
+    params.requestedTo !== null &&
+    params.chainTipLedger !== null &&
+    params.requestedTo > params.chainTipLedger;
+
+  if (beyondTip && params.chainTipLedger !== null && params.requestedTo !== null) {
+    gaps.push({
+      source: params.source,
+      kind: "beyond-tip",
+      fromLedger: params.chainTipLedger + 1,
+      toLedger: params.requestedTo,
+      reason: `requested end ledger ${params.requestedTo} exceeds chain tip ${params.chainTipLedger}`,
+    });
+  }
+
+  const partial = Boolean(params.scanError || params.truncated || beyondTip);
+  const complete = !pruned && !partial && gaps.length === 0;
 
   return {
-    committedEventIds,
-    committedEventIdsBySource,
-    lastCommittedEventId,
-    lastCommittedEventIdBySource,
-    committedCount,
-    committedCountBySource,
-    trimmedTrailingBytes,
+    source: params.source,
+    contractId: params.contractId,
+    complete,
+    requestedRange,
+    observedRange,
+    retainedFloorLedger: params.retainedFloorLedger,
+    chainTipLedger: params.chainTipLedger,
+    pruned,
+    partial,
+    gaps,
   };
 }
 
-async function defaultWriteOutputLine(filePath: string, line: string): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  const fh = await open(filePath, "a");
-  try {
-    await fh.write(line, null, "utf8");
-    await fh.sync();
-  } finally {
-    await fh.close();
-  }
+export function buildCompletenessCertificate(params: {
+  network: string;
+  rpcUrl: string;
+  dryRun: boolean;
+  requestedFrom: string | number;
+  requestedTo: number | null;
+  targets: ReplayTargetCertificate[];
+}): ReplayCompletenessCertificate {
+  const requestedFromLedger = parseRequestedFromLedger(params.requestedFrom);
+  const requestedRange: ReplayTargetRange = {
+    from: normalizeRangeFrom(params.requestedFrom),
+    fromLedger: requestedFromLedger,
+    toLedger: params.requestedTo,
+  };
+
+  const fromLedgers = params.targets
+    .map((t) => t.observedRange.fromLedger)
+    .filter((v): v is number => v !== null);
+  const toLedgers = params.targets
+    .map((t) => t.observedRange.toLedger)
+    .filter((v): v is number => v !== null);
+
+  const observedRange: ReplayObservedRange = {
+    fromLedger: fromLedgers.length > 0 ? Math.min(...fromLedgers) : null,
+    toLedger: toLedgers.length > 0 ? Math.max(...toLedgers) : null,
+  };
+
+  const gaps = params.targets.flatMap((t) => t.gaps);
+  const complete = params.targets.length > 0 && params.targets.every((t) => t.complete);
+
+  const payload = {
+    format: "mimir-replay-certificate-v1" as const,
+    version: 1 as const,
+    network: params.network,
+    rpcUrl: params.rpcUrl,
+    dryRun: params.dryRun,
+    complete,
+    requestedRange,
+    observedRange,
+    gaps,
+    targets: params.targets,
+  };
+
+  const digest = createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex");
+
+  return {
+    ...payload,
+    digest,
+  };
 }
 
 export function normalizeRangeFrom(from: string | number): string {
@@ -687,13 +737,36 @@ async function replayContract(
     progress(
       `[replay] ${target.source}: already completed in progress file (pages=${opts.targetProgress.pagesProcessed} events=${opts.targetProgress.eventsProcessed} sent=${opts.targetProgress.eventsSent})`,
     );
+    const savedStartClamped = opts.targetProgress.startClamped ?? false;
+    const savedObservedFrom =
+      opts.targetProgress.observedFromLedger ??
+      parseRequestedFromLedger(opts.from) ??
+      opts.targetProgress.lastEventLedger;
+    const savedObservedTo =
+      opts.targetProgress.observedToLedger ??
+      opts.targetProgress.chainTipLedger ??
+      toLedger ??
+      opts.targetProgress.lastEventLedger;
+    const certificate = buildTargetCertificate({
+      source: target.source,
+      contractId: target.contractId,
+      requestedFrom: opts.from,
+      requestedTo: toLedger,
+      observedFromLedger: savedObservedFrom,
+      observedToLedger: savedObservedTo,
+      retainedFloorLedger: opts.targetProgress.retainedFloorLedger ?? null,
+      chainTipLedger: opts.targetProgress.chainTipLedger ?? null,
+      startClamped: savedStartClamped,
+      truncated: false,
+      pages: opts.targetProgress.pagesProcessed,
+    });
     return {
       source: target.source,
       contractId: target.contractId,
-      fromLedger: opts.targetProgress.lastEventLedger ?? 0,
+      fromLedger: savedObservedFrom ?? opts.targetProgress.lastEventLedger ?? 0,
       toLedger,
-      startLedger: null,
-      startClamped: false,
+      startLedger: savedObservedFrom,
+      startClamped: savedStartClamped,
       pages: opts.targetProgress.pagesProcessed,
       events: opts.targetProgress.eventsProcessed,
       sent: opts.targetProgress.eventsSent,
@@ -752,6 +825,9 @@ async function replayContract(
   const window = validateLedgerWindow(await server.getHealth());
 
   const isResuming = !!opts.targetProgress;
+  const initialStartClamped = opts.targetProgress?.startClamped ?? false;
+  const initialObservedFromLedger = opts.targetProgress?.observedFromLedger ?? null;
+  const initialRetainedFloorLedger = opts.targetProgress?.retainedFloorLedger ?? window.oldestLedger;
   let lastProcessedEventId: string | null = opts.targetProgress?.lastProcessedEventId ?? null;
   let lastEventLedger: number | null = opts.targetProgress?.lastEventLedger ?? null;
   let resumedSkippedEvents = 0;
@@ -1113,6 +1189,16 @@ async function replayContract(
 
     // Persist checkpoint after each completed page
     if (opts.onPageComplete) {
+      const pageObservedFrom =
+        initialObservedFromLedger ??
+        usedStartLedger ??
+        startLedger ??
+        (startCursor ? eventCursorLedger(startCursor) : null) ??
+        firstStartLedger;
+      const pageObservedTo =
+        isFinalPage && !truncated
+          ? (effectiveTo ?? latestLedger)
+          : (eventCursorLedger(lastCursor ?? "") ?? lastEventLedger ?? pageObservedFrom);
       await opts.onPageComplete({
         contractId: target.contractId,
         cursor: lastCursor,
@@ -1129,8 +1215,11 @@ async function replayContract(
         completed,
         budgetExhausted,
         failedSends,
-        lastCommittedOutputEventId,
-        committedOutputRecords,
+        observedFromLedger: pageObservedFrom,
+        observedToLedger: pageObservedTo,
+        retainedFloorLedger: initialRetainedFloorLedger,
+        chainTipLedger: latestLedger,
+        startClamped: usedStartClamped || startClamped || initialStartClamped,
       });
     }
 
@@ -1140,6 +1229,30 @@ async function replayContract(
   }
 
   const finalPages = (opts.targetProgress?.pagesProcessed ?? 0) + pagesInThisRun;
+  const finalStartClamped = usedStartClamped || startClamped || initialStartClamped;
+  const observedFromLedger =
+    initialObservedFromLedger ??
+    usedStartLedger ??
+    startLedger ??
+    (startCursor ? eventCursorLedger(startCursor) : null) ??
+    firstStartLedger;
+  const observedToLedger = truncated
+    ? (eventCursorLedger(lastCursor ?? "") ?? lastEventLedger ?? observedFromLedger)
+    : (effectiveTo ?? latestLedger);
+
+  const certificate = buildTargetCertificate({
+    source: target.source,
+    contractId: target.contractId,
+    requestedFrom: opts.from,
+    requestedTo: toLedger,
+    observedFromLedger,
+    observedToLedger,
+    retainedFloorLedger: initialRetainedFloorLedger,
+    chainTipLedger: latestLedger,
+    startClamped: finalStartClamped,
+    truncated,
+    pages: finalPages,
+  });
 
   progress(
     `[replay] ${target.source}: pages=${finalPages} events=${totalProcessedEvents} sent=${sent} ` +
@@ -1154,7 +1267,7 @@ async function replayContract(
     fromLedger: usedStartLedger ?? window.oldestLedger,
     toLedger: effectiveTo,
     startLedger: usedStartLedger,
-    startClamped: usedStartClamped,
+    startClamped: finalStartClamped,
     pages: finalPages,
     events: totalProcessedEvents,
     sent,
@@ -1210,7 +1323,7 @@ export async function runReplayCli(opts: {
   const dryRun = !boolFlag("send"); // Default is dry-run; --send enables actual sending.
   const asJson = boolFlag("json");
   const progressFile = flag("progress-file");
-  const outputFile = flag("output-file") ?? flag("out");
+  const certificateFile = flag("certificate-file");
   const rpmRaw = flag("rpm");
   const maxEventsRaw = flag("max-events");
   const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
@@ -1325,7 +1438,7 @@ export async function runReplayCli(opts: {
     progress(`[replay] from      ${fromRaw}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
     progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
     if (progressFile) progress(`[replay] progress  ${progressFile}`);
-    if (outputFile) progress(`[replay] output    ${outputFile}`);
+    if (certificateFile) progress(`[replay] cert      ${certificateFile}`);
     if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
     if (maxEvents !== undefined) progress(`[replay] maxEvents ${maxEvents}`);
   } else {
@@ -1466,10 +1579,7 @@ export async function runReplayCli(opts: {
           dryRun,
           contracts: requestedContracts,
           progressFile,
-          outputFile,
-          committedOutputIds: targetCommittedIds,
-          initialCommittedOutputCount: targetCommittedCount,
-          initialLastCommittedOutputEventId: targetLastCommittedId,
+          certificateFile,
           rpm,
           maxEvents,
           eventBudget,
@@ -1555,6 +1665,7 @@ export async function runReplayCli(opts: {
     completed: allCompleted,
     targets: targetResults,
     totals,
+    certificate,
   };
 
   if (asJson) {
@@ -1570,6 +1681,9 @@ export async function runReplayCli(opts: {
         `capped=${totals.capped} admin=${totals.adminLogged} duplicates=${totals.duplicates}` +
         ` completed=${allCompleted} budgetExhausted=${anyBudgetExhausted}` +
         ((totals.resumedSkippedEvents ?? 0) > 0 ? ` resumedSkipped=${totals.resumedSkippedEvents}` : ""),
+    );
+    progress(
+      `[replay] certificate  complete=${certificate.complete} gaps=${certificate.gaps.length} digest=${certificate.digest.slice(0, 12)}`,
     );
   }
 
