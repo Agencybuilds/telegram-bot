@@ -78,6 +78,11 @@ import {
 
 // ── Replay report types ───────────────────────────────────────────────────────
 
+/** POSIX exit code for SIGINT-cancelled replay (128 + SIGINT(2)). */
+export const EXIT_REPLAY_CANCELLED = 130;
+
+export type ReplayRunStatus = "completed" | "cancelled" | "failed";
+
 export interface ReplayEventSummary {
   ledger: number;
   txHash: string;
@@ -197,6 +202,8 @@ export interface ReplayProgressFile {
   /** Normalized SHA-256 fingerprint of the replay filter set (network, range, contracts, contractIds). */
   filterFingerprint?: string | undefined;
   targets: Partial<Record<ContractSource, ReplayProgressTarget>>;
+  status?: "in_progress" | "completed" | "cancelled" | undefined;
+  resumable?: boolean | undefined;
 }
 
 // ── RPC Request Budget Tracker ───────────────────────────────────────────────
@@ -317,6 +324,8 @@ export interface ReplayOptions {
   onPageComplete?: ((targetUpdate: ReplayProgressTarget) => Promise<void>) | undefined;
   /** Global RPC budget tracker. */
   budget?: RpcBudgetTracker | undefined;
+  /** Optional cancellation signal (e.g. from SIGINT handler). */
+  signal?: AbortSignal | undefined;
 }
 
 export interface ReplayDeps {
@@ -339,8 +348,8 @@ export interface ReplayDeps {
   sleep?: ((ms: number) => Promise<void>) | undefined;
   /** Timestamp provider for deterministic rate-limit / delay tests. */
   now?: (() => number) | undefined;
-  /** Optional output line writer for testing interrupted or partial output writes. */
-  writeOutputLine?: ((filePath: string, line: string) => Promise<void>) | undefined;
+  /** Optional cancellation signal for testing SIGINT / abort handling. */
+  signal?: AbortSignal | undefined;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -806,6 +815,7 @@ async function replayContract(
 
   let lastCursor: string | null = opts.targetProgress?.cursor ?? null;
   let truncated = false;
+  let cancelled = false;
   let stoppedByToLedger = false;
   let budgetExhausted = false;
   let completed = false;
@@ -830,6 +840,10 @@ async function replayContract(
   }
 
   for (;;) {
+    if (opts.signal?.aborted) {
+      cancelled = true;
+      break;
+    }
     if (pagesInThisRun >= maxPages) {
       truncated = true;
       break;
@@ -838,10 +852,21 @@ async function replayContract(
     const totalPages = (opts.targetProgress?.pagesProcessed ?? 0) + pagesInThisRun;
 
     if (opts.budget) await opts.budget.acquire();
+    if (opts.signal?.aborted) {
+      pagesInThisRun -= 1;
+      cancelled = true;
+      break;
+    }
 
     const response: rpc.Api.GetEventsResponse = cursor
       ? await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], cursor, limit: pageLimit }))
       : await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], startLedger: firstStartLedger, limit: pageLimit }));
+
+    if (opts.signal?.aborted) {
+      pagesInThisRun -= 1;
+      cancelled = true;
+      break;
+    }
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     const pageDecoded: DecodedEvent[] = [];
@@ -1043,6 +1068,13 @@ async function replayContract(
       }
     }
 
+    // If cancelled mid-page, do NOT commit partial page progress to disk.
+    if (cancelled || opts.signal?.aborted) {
+      cancelled = true;
+      pagesInThisRun -= 1;
+      break;
+    }
+
     const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
     let isFinalPage = false;
 
@@ -1147,12 +1179,12 @@ async function replayContract(
  * server and fake send function, without spawning a subprocess.
  *
  * Returns a `ReplayReport` and the process exit code (0 = success, 1 = fatal
- * error, 2 = usage error).
+ * error, 2 = usage error, 130 = cancelled by SIGINT).
  */
 export async function runReplayCli(opts: {
   argv?: string[];
   deps?: Partial<ReplayDeps>;
-} = {}): Promise<{ report: ReplayReport | null; exitCode: 0 | 1 | 2 }> {
+} = {}): Promise<{ report: ReplayReport | null; exitCode: 0 | 1 | 2 | 130 }> {
   const argv = opts.argv ?? process.argv;
   const overrideDeps = opts.deps ?? {};
 
@@ -1400,62 +1432,26 @@ export async function runReplayCli(opts: {
   let fatalError: string | undefined;
   const writeLine = overrideDeps.writeOutputLine ?? defaultWriteOutputLine;
 
-  for (const target of targets) {
-    const targetProgress = progressData?.targets?.[target.source];
-    const targetCommittedIds = preparedOutput?.committedEventIdsBySource[target.source];
-    const targetCommittedCount =
-      preparedOutput?.committedCountBySource[target.source] ?? targetProgress?.committedOutputRecords ?? 0;
-    const targetLastCommittedId =
-      preparedOutput?.lastCommittedEventIdBySource[target.source] ??
-      targetProgress?.lastCommittedOutputEventId ??
-      null;
-
-    const onOutputRecord = outputFile
-      ? async (
-          record: ReplayOutputRecord,
-          update: { lastCommittedOutputEventId: string; committedOutputRecords: number },
-        ) => {
-          const line = `${JSON.stringify(record, scanJsonReplacer)}\n`;
-          await writeLine(outputFile, line);
-          if (progressData && progressFile) {
-            const existing = progressData.targets[target.source];
-            progressData.targets[target.source] = existing
-              ? {
-                  ...existing,
-                  lastCommittedOutputEventId: update.lastCommittedOutputEventId,
-                  committedOutputRecords: update.committedOutputRecords,
-                }
-              : {
-                  contractId: target.contractId,
-                  cursor: null,
-                  lastEventLedger: null,
-                  lastProcessedEventId: null,
-                  recentEventIds: [],
-                  pagesProcessed: 0,
-                  eventsProcessed: 0,
-                  eventsSent: 0,
-                  eventsSkipped: 0,
-                  eventsCapped: 0,
-                  adminLogged: 0,
-                  duplicates: 0,
-                  completed: false,
-                  lastCommittedOutputEventId: update.lastCommittedOutputEventId,
-                  committedOutputRecords: update.committedOutputRecords,
-                };
-            progressData.updatedAt = new Date().toISOString();
-            await writeProgressFileAtomic(progressFile, progressData);
-          }
-        }
-      : undefined;
-
-    const onPageComplete = progressFile
-      ? async (update: ReplayProgressTarget) => {
-          if (!progressData) return;
-          progressData.targets[target.source] = update;
-          progressData.updatedAt = new Date().toISOString();
-          await writeProgressFileAtomic(progressFile, progressData);
-        }
-      : undefined;
+  const cancelController = new AbortController();
+  const onExternalAbort = (): void => {
+    if (!cancelController.signal.aborted) {
+      cancelController.abort();
+    }
+  };
+  if (overrideDeps.signal) {
+    if (overrideDeps.signal.aborted) {
+      onExternalAbort();
+    } else {
+      overrideDeps.signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+  const onSigint = (): void => {
+    if (!cancelController.signal.aborted) {
+      progress(`[replay] SIGINT received — stopping after committed progress`);
+      cancelController.abort();
+    }
+  };
+  process.on("SIGINT", onSigint);
 
     try {
       const result = await replayContract(
@@ -1563,6 +1559,11 @@ export async function runReplayCli(opts: {
 
   if (asJson) {
     process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
+  } else if (wasCancelled) {
+    progress(
+      `[replay] cancelled  resumable=${isResumable} events=${totals.events} sent=${totals.sent} ` +
+        `skipped=${totals.skipped} capped=${totals.capped} admin=${totals.adminLogged} duplicates=${totals.duplicates}`,
+    );
   } else {
     progress(
       `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +
@@ -1572,7 +1573,10 @@ export async function runReplayCli(opts: {
     );
   }
 
-  return { report, exitCode: fatalError ? 1 : 0 };
+  return {
+    report,
+    exitCode: wasCancelled ? EXIT_REPLAY_CANCELLED : fatalError ? 1 : 0,
+  };
 }
 
 // ── CLI entrypoint ─────────────────────────────────────────────────────────────
