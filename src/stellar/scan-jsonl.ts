@@ -8,6 +8,195 @@ export const DEFAULT_MAX_JSONL_LINE_BYTES = 64 * 1024; // 64 KiB
 /** Default chunk size in bytes when streaming JSONL files from disk. */
 export const DEFAULT_JSONL_CHUNK_BYTES = 64 * 1024; // 64 KiB
 
+export const ARCHIVE_SCHEMA_FORMAT = "mimir-event-archive" as const;
+export const SCAN_JSONL_SCHEMA_FORMAT = "mimir-scan-jsonl" as const;
+export const DEFAULT_ARCHIVE_SCHEMA_VERSION = 1 as const;
+export const SUPPORTED_ARCHIVE_READER_VERSIONS: readonly number[] = Object.freeze([1]);
+export const SUPPORTED_ARCHIVE_WRITER_VERSIONS: readonly number[] = Object.freeze([1]);
+
+export type ArchiveSchemaErrorCode =
+  | "UNSUPPORTED_SCHEMA_VERSION"
+  | "INVALID_SCHEMA_VERSION"
+  | "INCOMPATIBLE_SCHEMA_FORMAT"
+  | "MISSING_SCHEMA_VERSION"
+  | "NO_MUTUAL_SCHEMA_VERSION";
+
+export class UnsupportedArchiveSchemaError extends Error {
+  readonly code: ArchiveSchemaErrorCode;
+  readonly foundVersion: unknown;
+  readonly supportedVersions: readonly number[];
+
+  constructor(params: {
+    code: ArchiveSchemaErrorCode;
+    message: string;
+    foundVersion?: unknown;
+    supportedVersions?: readonly number[];
+  }) {
+    super(params.message);
+    this.name = "UnsupportedArchiveSchemaError";
+    this.code = params.code;
+    this.foundVersion = params.foundVersion;
+    this.supportedVersions = params.supportedVersions ?? SUPPORTED_ARCHIVE_READER_VERSIONS;
+  }
+}
+
+export interface ArchiveSchemaCapabilities {
+  archiveFormat: typeof ARCHIVE_SCHEMA_FORMAT;
+  jsonlFormat: typeof SCAN_JSONL_SCHEMA_FORMAT;
+  readerVersions: readonly number[];
+  writerVersions: readonly number[];
+  defaultWriterVersion: number;
+}
+
+export function getSupportedArchiveSchemaVersions(): ArchiveSchemaCapabilities {
+  return {
+    archiveFormat: ARCHIVE_SCHEMA_FORMAT,
+    jsonlFormat: SCAN_JSONL_SCHEMA_FORMAT,
+    readerVersions: SUPPORTED_ARCHIVE_READER_VERSIONS,
+    writerVersions: SUPPORTED_ARCHIVE_WRITER_VERSIONS,
+    defaultWriterVersion: DEFAULT_ARCHIVE_SCHEMA_VERSION,
+  };
+}
+
+export interface SchemaNegotiationRequest {
+  format: string;
+  mode: "read" | "write";
+  requestedVersion?: unknown;
+  peerSupportedVersions?: readonly number[];
+  acceptedVersions?: readonly number[];
+}
+
+function assertPositiveIntegerVersion(version: unknown, context: string): number {
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    throw new UnsupportedArchiveSchemaError({
+      code: "INVALID_SCHEMA_VERSION",
+      foundVersion: version,
+      message: `Invalid schema version in ${context}: expected a positive integer`,
+    });
+  }
+  return version;
+}
+
+function supportedVersionsFor(mode: "read" | "write"): readonly number[] {
+  return mode === "read"
+    ? SUPPORTED_ARCHIVE_READER_VERSIONS
+    : SUPPORTED_ARCHIVE_WRITER_VERSIONS;
+}
+
+function assertKnownFormat(format: string): void {
+  if (format === ARCHIVE_SCHEMA_FORMAT || format === SCAN_JSONL_SCHEMA_FORMAT) return;
+
+  const versionSuffix = /-v(\d+)$/.exec(format);
+  if (versionSuffix?.[1] !== undefined) {
+    const version = Number(versionSuffix[1]);
+    if (!SUPPORTED_ARCHIVE_READER_VERSIONS.includes(version)) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "UNSUPPORTED_SCHEMA_VERSION",
+        foundVersion: version,
+        message: `Unsupported archive schema format version v${version}`,
+      });
+    }
+  }
+  throw new UnsupportedArchiveSchemaError({
+    code: "INCOMPATIBLE_SCHEMA_FORMAT",
+    foundVersion: format,
+    message: `Incompatible archive schema format "${format}"`,
+  });
+}
+
+export function negotiateArchiveSchemaVersion(
+  request: SchemaNegotiationRequest,
+): number {
+  assertKnownFormat(request.format);
+  const baseSupported = supportedVersionsFor(request.mode);
+  let localSupported = baseSupported;
+
+  if (request.acceptedVersions !== undefined) {
+    if (!Array.isArray(request.acceptedVersions) || request.acceptedVersions.length === 0) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "INVALID_SCHEMA_VERSION",
+        supportedVersions: baseSupported,
+        message: "acceptedVersions must be a non-empty array of supported schema versions",
+      });
+    }
+    for (const version of request.acceptedVersions) {
+      const accepted = assertPositiveIntegerVersion(version, "acceptedVersions");
+      if (!baseSupported.includes(accepted)) {
+        throw new UnsupportedArchiveSchemaError({
+          code: "UNSUPPORTED_SCHEMA_VERSION",
+          foundVersion: accepted,
+          supportedVersions: baseSupported,
+          message: `Unsupported accepted schema version v${accepted}`,
+        });
+      }
+    }
+    localSupported = [...new Set(request.acceptedVersions)];
+  }
+
+  if (request.requestedVersion !== undefined) {
+    const requested = assertPositiveIntegerVersion(
+      request.requestedVersion,
+      `${request.mode} negotiation`,
+    );
+    if (!localSupported.includes(requested)) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "UNSUPPORTED_SCHEMA_VERSION",
+        foundVersion: requested,
+        supportedVersions: localSupported,
+        message: `Unsupported ${request.mode} archive schema version v${requested}`,
+      });
+    }
+    if (
+      request.peerSupportedVersions !== undefined &&
+      !request.peerSupportedVersions.includes(requested)
+    ) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "NO_MUTUAL_SCHEMA_VERSION",
+        foundVersion: requested,
+        supportedVersions: localSupported,
+        message: `Peer does not support requested archive schema version v${requested}`,
+      });
+    }
+    return requested;
+  }
+
+  if (request.peerSupportedVersions !== undefined) {
+    if (
+      !Array.isArray(request.peerSupportedVersions) ||
+      request.peerSupportedVersions.length === 0
+    ) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "NO_MUTUAL_SCHEMA_VERSION",
+        supportedVersions: localSupported,
+        message: "Peer advertised no supported archive schema versions",
+      });
+    }
+    const peerVersions = request.peerSupportedVersions.map((version) =>
+      assertPositiveIntegerVersion(version, "peerSupportedVersions"),
+    );
+    const common = localSupported.filter((version) => peerVersions.includes(version));
+    if (common.length === 0) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "NO_MUTUAL_SCHEMA_VERSION",
+        foundVersion: peerVersions,
+        supportedVersions: localSupported,
+        message: "No mutually supported archive schema version",
+      });
+    }
+    return Math.max(...common);
+  }
+
+  return request.mode === "write"
+    ? DEFAULT_ARCHIVE_SCHEMA_VERSION
+    : (localSupported[localSupported.length - 1] ?? DEFAULT_ARCHIVE_SCHEMA_VERSION);
+}
+
+export interface ScanJsonlSchemaLine {
+  type: "schema";
+  format: typeof SCAN_JSONL_SCHEMA_FORMAT;
+  schemaVersion: number;
+}
+
 export interface ScanJsonlEventLine extends DecodedEvent {
   type: "event";
 }
@@ -18,252 +207,46 @@ export interface ScanJsonlSummaryLine {
   histogram: Record<string, number>;
 }
 
-export interface BoundedJsonlStreamOptions {
-  /**
-   * Maximum allowed byte length of a single JSONL record (excluding `\n` / `\r\n`).
-   * Records exceeding this limit are rejected before UTF-8 decoding or `JSON.parse`.
-   * Defaults to {@link DEFAULT_MAX_JSONL_LINE_BYTES} (64 KiB).
-   */
-  maxLineBytes?: number;
-  /**
-   * Optional source label (e.g. filename) included in bounded error diagnostics.
-   */
-  source?: string;
+export interface FormatScanJsonlOptions {
+  schemaVersion?: number;
 }
 
-export interface JsonlLineRecord {
-  line: string;
-  lineNumber: number;
-  bytes: number;
+export interface ReadScanJsonlSchemaOptions {
+  acceptedVersions?: readonly number[];
+  requireExplicitVersion?: boolean;
 }
 
-/**
- * Thrown when a JSONL record exceeds the configured bounded line buffer limit.
- * Never includes raw record bytes in the error message.
- */
-export class JsonlLineTooLongError extends Error {
-  readonly maxLineBytes: number;
-  readonly actualBytes: number;
-  readonly lineNumber: number;
-  readonly source?: string;
-
-  constructor(opts: {
-    maxLineBytes: number;
-    actualBytes: number;
-    lineNumber: number;
-    source?: string;
-  }) {
-    const where = opts.source ? ` in ${opts.source}` : "";
-    super(
-      `JSONL record at line ${opts.lineNumber}${where} exceeds max line size of ${opts.maxLineBytes} bytes (observed >= ${opts.actualBytes} bytes)`,
-    );
-    this.name = "JsonlLineTooLongError";
-    this.maxLineBytes = opts.maxLineBytes;
-    this.actualBytes = opts.actualBytes;
-    this.lineNumber = opts.lineNumber;
-    if (opts.source !== undefined) {
-      this.source = opts.source;
-    }
-  }
+export interface ParsedScanJsonl {
+  schemaVersion: number;
+  explicitVersionFound: boolean;
+  events: DecodedEvent[];
+  summary: ScanJsonlSummaryLine | null;
 }
 
-function validatePositiveInt(value: number, name: string): number {
-  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
-    throw new RangeError(`${name} must be a positive finite integer`);
-  }
-  return value;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function toBuffer(chunk: Buffer | Uint8Array | string): Buffer {
-  if (typeof chunk === "string") {
-    return Buffer.from(chunk, "utf8");
-  }
-  if (Buffer.isBuffer(chunk)) {
-    return chunk;
-  }
-  return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-}
-
-/**
- * Stream non-empty lines from an async iterable of byte chunks (or strings)
- * using a bounded line buffer. Rejects any line whose raw UTF-8 byte length
- * (excluding trailing `\r`/`\n`) exceeds `maxLineBytes` before decoding or parsing.
- */
-export async function* streamBoundedJsonlLines(
-  chunks: AsyncIterable<Buffer | Uint8Array | string>,
-  options: BoundedJsonlStreamOptions = {},
-): AsyncGenerator<JsonlLineRecord, void, unknown> {
-  const maxLineBytes = validatePositiveInt(
-    options.maxLineBytes ?? DEFAULT_MAX_JSONL_LINE_BYTES,
-    "maxLineBytes",
+function isDecodedEventRecord(value: unknown): value is DecodedEvent {
+  if (!isRecord(value) || !isRecord(value.payload)) return false;
+  return (
+    (value.source === "market" || value.source === "squad") &&
+    typeof value.contractId === "string" &&
+    typeof value.version === "string" &&
+    typeof value.ledger === "number" &&
+    typeof value.txHash === "string" &&
+    typeof value.at === "number" &&
+    typeof value.eventId === "string" &&
+    typeof value.eventType === "string"
   );
-  const source = options.source;
-
-  const pendingChunks: Buffer[] = [];
-  let pendingBytes = 0;
-  let lineNumber = 1;
-
-  for await (const rawChunk of chunks) {
-    const chunk = toBuffer(rawChunk);
-    if (chunk.byteLength === 0) continue;
-
-    let offset = 0;
-    while (offset < chunk.byteLength) {
-      const newlineIdx = chunk.indexOf(0x0a, offset);
-
-      if (newlineIdx === -1) {
-        // No newline in the remainder of this chunk.
-        const rem = chunk.subarray(offset);
-        const newPendingBytes = pendingBytes + rem.byteLength;
-        // Allow 1 extra byte only if the last byte is `\r` (0x0d), in case
-        // the next chunk starts with `\n` (0x0a) to form `\r\n`.
-        const endsWithCr = rem[rem.byteLength - 1] === 0x0d;
-        const effectiveBytes = endsWithCr ? newPendingBytes - 1 : newPendingBytes;
-        if (effectiveBytes > maxLineBytes) {
-          throw new JsonlLineTooLongError({
-            maxLineBytes,
-            actualBytes: effectiveBytes,
-            lineNumber,
-            ...(source !== undefined ? { source } : {}),
-          });
-        }
-        // Copy so callers may safely reuse the underlying read buffer.
-        pendingChunks.push(Buffer.from(rem));
-        pendingBytes = newPendingBytes;
-        break;
-      }
-
-      // Found `\n` at newlineIdx.
-      let lineStr: string;
-      let lineBytes: number;
-
-      if (pendingBytes === 0) {
-        // Fast path: entire line is within the current chunk.
-        let lineEnd = newlineIdx;
-        if (lineEnd > offset && chunk[lineEnd - 1] === 0x0d) {
-          lineEnd -= 1;
-        }
-        lineBytes = lineEnd - offset;
-        if (lineBytes > maxLineBytes) {
-          throw new JsonlLineTooLongError({
-            maxLineBytes,
-            actualBytes: lineBytes,
-            lineNumber,
-            ...(source !== undefined ? { source } : {}),
-          });
-        }
-        lineStr = chunk.toString("utf8", offset, lineEnd);
-      } else {
-        // Cross-chunk path: combine pendingChunks + head of current chunk.
-        let partEnd = newlineIdx;
-        let trimPendingCr = false;
-
-        if (partEnd > offset) {
-          if (chunk[partEnd - 1] === 0x0d) {
-            partEnd -= 1;
-          }
-        } else {
-          // newlineIdx === offset: check if the previous chunk ended with `\r`.
-          const lastPending = pendingChunks[pendingChunks.length - 1];
-          if (lastPending && lastPending[lastPending.byteLength - 1] === 0x0d) {
-            trimPendingCr = true;
-          }
-        }
-
-        const partLen = partEnd - offset;
-        const effectivePendingBytes = trimPendingCr ? pendingBytes - 1 : pendingBytes;
-        lineBytes = effectivePendingBytes + partLen;
-
-        if (lineBytes > maxLineBytes) {
-          throw new JsonlLineTooLongError({
-            maxLineBytes,
-            actualBytes: lineBytes,
-            lineNumber,
-            ...(source !== undefined ? { source } : {}),
-          });
-        }
-
-        if (trimPendingCr) {
-          const lastIdx = pendingChunks.length - 1;
-          const lastBuf = pendingChunks[lastIdx]!;
-          if (lastBuf.byteLength === 1) {
-            pendingChunks.pop();
-          } else {
-            pendingChunks[lastIdx] = lastBuf.subarray(0, lastBuf.byteLength - 1);
-          }
-        }
-        if (partLen > 0) {
-          pendingChunks.push(chunk.subarray(offset, partEnd));
-        }
-
-        const combined =
-          pendingChunks.length === 1
-            ? pendingChunks[0]!
-            : Buffer.concat(pendingChunks, lineBytes);
-        lineStr = combined.toString("utf8");
-        pendingChunks.length = 0;
-        pendingBytes = 0;
-      }
-
-      const currentLineNumber = lineNumber;
-      lineNumber += 1;
-      offset = newlineIdx + 1;
-
-      const trimmed = lineStr.trim();
-      if (trimmed.length > 0) {
-        yield { line: trimmed, lineNumber: currentLineNumber, bytes: lineBytes };
-      }
-    }
-  }
-
-  // Handle trailing line at EOF without a final `\n`.
-  if (pendingBytes > 0) {
-    let lineBytes = pendingBytes;
-    const lastPending = pendingChunks[pendingChunks.length - 1];
-    if (lastPending && lastPending[lastPending.byteLength - 1] === 0x0d) {
-      lineBytes -= 1;
-      const lastIdx = pendingChunks.length - 1;
-      if (lastPending.byteLength === 1) {
-        pendingChunks.pop();
-      } else {
-        pendingChunks[lastIdx] = lastPending.subarray(0, lastPending.byteLength - 1);
-      }
-    }
-
-    if (lineBytes > maxLineBytes) {
-      throw new JsonlLineTooLongError({
-        maxLineBytes,
-        actualBytes: lineBytes,
-        lineNumber,
-        ...(source !== undefined ? { source } : {}),
-      });
-    }
-
-    const combined =
-      pendingChunks.length === 1
-        ? pendingChunks[0]!
-        : Buffer.concat(pendingChunks, lineBytes);
-    const trimmed = combined.toString("utf8").trim();
-    pendingChunks.length = 0;
-    pendingBytes = 0;
-
-    if (trimmed.length > 0) {
-      yield { line: trimmed, lineNumber, bytes: lineBytes };
-    }
-  }
 }
 
-/**
- * Stream and parse JSONL records from an async iterable of chunks with a
- * bounded line buffer. Oversized records are rejected before `JSON.parse`.
- */
-export async function* parseJsonlStream<T = unknown>(
-  chunks: AsyncIterable<Buffer | Uint8Array | string>,
-  options: BoundedJsonlStreamOptions = {},
-): AsyncGenerator<T, void, unknown> {
-  for await (const { line } of streamBoundedJsonlLines(chunks, options)) {
-    yield JSON.parse(line) as T;
+function isScanJsonlSummaryLine(value: unknown): value is ScanJsonlSummaryLine {
+  if (!isRecord(value) || value.type !== "summary" || typeof value.eventCount !== "number") {
+    return false;
   }
+  if (!isRecord(value.histogram)) return false;
+  return Object.values(value.histogram).every((count) => typeof count === "number");
 }
 
 /**
@@ -276,35 +259,20 @@ export function formatScanJsonl(
   events: readonly DecodedEvent[],
   options: FormatScanJsonlOptions = {},
 ): string {
-  const { metadata, expectedNetwork, expectedContractId } = options;
-
-  if (expectedNetwork !== undefined && metadata?.network !== undefined && metadata.network !== expectedNetwork) {
-    throw new ArchiveMetadataConflictError(
-      `Scan network "${metadata.network}" contradicts expected network "${expectedNetwork}"`,
-    );
-  }
-  if (
-    expectedContractId !== undefined &&
-    metadata?.contractId !== undefined &&
-    metadata.contractId !== expectedContractId
-  ) {
-    throw new ArchiveMetadataConflictError(
-      `Scan contractId "${metadata.contractId}" contradicts expected contractId "${expectedContractId}"`,
-    );
-  }
-
-  const effectiveContractId = expectedContractId ?? metadata?.contractId;
-  if (effectiveContractId !== undefined) {
-    for (const event of events) {
-      if (event.contractId !== effectiveContractId) {
-        throw new ArchiveMetadataConflictError(
-          `Event contractId "${event.contractId}" contradicts expected contractId "${effectiveContractId}"`,
-        );
-      }
-    }
-  }
-
   const lines: string[] = [];
+  if (options.schemaVersion !== undefined) {
+    const schemaVersion = negotiateArchiveSchemaVersion({
+      format: SCAN_JSONL_SCHEMA_FORMAT,
+      mode: "write",
+      requestedVersion: options.schemaVersion,
+    });
+    const schema: ScanJsonlSchemaLine = {
+      type: "schema",
+      format: SCAN_JSONL_SCHEMA_FORMAT,
+      schemaVersion,
+    };
+    lines.push(JSON.stringify(schema));
+  }
   for (const event of events) {
     lines.push(JSON.stringify({ type: "event", ...event }, scanJsonReplacer));
   }
@@ -317,72 +285,97 @@ export function formatScanJsonl(
   return lines.join("\n") + "\n";
 }
 
-/**
- * Compact a canonical JSONL scan export to an inclusive ledger range.
- *
- * Retains only `{ type: "event" }` records whose `ledger` is within
- * `[firstLedger, lastLedger]`, then rebuilds the trailing `{ type: "summary" }`
- * metadata (`eventCount` and histogram) from the retained events. Any existing
- * summary line is replaced, so a stale summary can never survive compaction.
- * Output is canonical LF JSONL with a single trailing newline.
- *
- * A malformed or unrecognized record aborts the compaction by throwing
- * {@link MalformedScanJsonlRecordError}; input is never silently dropped.
- *
- * @throws {RangeError} when the range is invalid (see `validateLedgerRange`).
- * @throws {MalformedScanJsonlRecordError} on a non-JSON, non-event, or
- * ledger-less record.
- */
-export function compactScanJsonl(
+export function parseScanJsonl(
   input: string,
-  range: LedgerRange,
-): CompactScanJsonlResult {
-  validateLedgerRange(range);
-  const { firstLedger, lastLedger } = range;
+  options: ReadScanJsonlSchemaOptions = {},
+): ParsedScanJsonl {
+  const events: DecodedEvent[] = [];
+  let summary: ScanJsonlSummaryLine | null = null;
+  let explicitVersionFound = false;
+  let schemaVersion: number = DEFAULT_ARCHIVE_SCHEMA_VERSION;
+  let recordCount = 0;
 
-  const retainedEvents: DecodedEvent[] = [];
-  let dropped = 0;
+  for (const [index, rawLine] of input.split(/\r?\n/).entries()) {
+    const line = rawLine.trim();
+    if (!line) continue;
 
-  const lines = input.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    let parsed: unknown;
+    let record: unknown;
     try {
-      parsed = JSON.parse(trimmed);
+      record = JSON.parse(line) as unknown;
     } catch {
-      throw new MalformedScanJsonlRecordError(index + 1);
+      throw new Error(`Malformed scan JSONL record at line ${index + 1}`);
+    }
+    if (!isRecord(record)) {
+      throw new Error(`Malformed scan JSONL record at line ${index + 1}`);
     }
 
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new MalformedScanJsonlRecordError(index + 1);
+    if (recordCount === 0 && record.type === "schema") {
+      if (typeof record.format !== "string") {
+        throw new UnsupportedArchiveSchemaError({
+          code: "INCOMPATIBLE_SCHEMA_FORMAT",
+          foundVersion: record.format,
+          message: "Scan JSONL schema header must include a format",
+        });
+      }
+      if (record.schemaVersion === undefined) {
+        throw new UnsupportedArchiveSchemaError({
+          code: "INVALID_SCHEMA_VERSION",
+          message: "Scan JSONL schema header must declare a schemaVersion",
+        });
+      }
+      schemaVersion = negotiateArchiveSchemaVersion({
+        format: record.format,
+        mode: "read",
+        requestedVersion: record.schemaVersion,
+        acceptedVersions: options.acceptedVersions,
+      });
+      if (record.format !== SCAN_JSONL_SCHEMA_FORMAT) {
+        throw new UnsupportedArchiveSchemaError({
+          code: "INCOMPATIBLE_SCHEMA_FORMAT",
+          foundVersion: record.format,
+          message: `Incompatible scan JSONL schema format "${record.format}"`,
+        });
+      }
+      explicitVersionFound = true;
+      recordCount += 1;
+      continue;
     }
 
-    const record = parsed as Record<string, unknown>;
-    if (record.type === "summary") {
-      continue; // rebuilt from the retained events below
+    if (record.type === "schema") {
+      throw new Error(`Unexpected scan JSONL schema record at line ${index + 1}`);
     }
-    if (record.type !== "event") {
-      throw new MalformedScanJsonlRecordError(index + 1);
-    }
-
-    const ledger = record.ledger;
-    if (typeof ledger !== "number" || !Number.isSafeInteger(ledger)) {
-      throw new MalformedScanJsonlRecordError(index + 1);
-    }
-
-    if (ledger >= firstLedger && ledger <= lastLedger) {
-      retainedEvents.push(parsed as DecodedEvent);
+    if (record.type === "event") {
+      const { type: _type, ...event } = record;
+      if (!isDecodedEventRecord(event)) {
+        throw new Error(`Malformed scan JSONL event at line ${index + 1}`);
+      }
+      events.push(event);
+    } else if (record.type === "summary") {
+      if (summary !== null || !isScanJsonlSummaryLine(record)) {
+        throw new Error(`Malformed scan JSONL summary at line ${index + 1}`);
+      }
+      summary = record;
     } else {
-      dropped += 1;
+      throw new Error(`Unknown scan JSONL record type at line ${index + 1}`);
     }
+    recordCount += 1;
   }
 
-  return {
-    jsonl: formatScanJsonl(retainedEvents),
-    retained: retainedEvents.length,
-    dropped,
-  };
+  if (!explicitVersionFound) {
+    schemaVersion = negotiateArchiveSchemaVersion({
+      format: SCAN_JSONL_SCHEMA_FORMAT,
+      mode: "read",
+      requestedVersion: DEFAULT_ARCHIVE_SCHEMA_VERSION,
+      acceptedVersions: options.acceptedVersions,
+    });
+  }
+
+  if (options.requireExplicitVersion && !explicitVersionFound) {
+    throw new UnsupportedArchiveSchemaError({
+      code: "MISSING_SCHEMA_VERSION",
+      message: "Scan JSONL input does not declare an explicit schema version",
+    });
+  }
+
+  return { schemaVersion, explicitVersionFound, events, summary };
 }
