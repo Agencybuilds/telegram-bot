@@ -42,7 +42,7 @@ export interface JournalDestination {
 }
 
 export interface JournalEntry {
-  kind: "intent" | "done" | "timeout";
+  kind: "intent" | "retry" | "done";
   id: string;
   source: string;
   ledger: number;
@@ -61,41 +61,13 @@ export interface JournalEntry {
   errorDescription?: string;
   at: number;
   /**
-   * Bounded, scrubbed description of the timeout that produced this entry.
-   * Only present on `timeout` lines; never on `intent` or `done` lines.
-   * Never contains bot tokens or raw chat ids.
+   * Epoch milliseconds when the next retry attempt is eligible.
+   * Stored with pending deliveries so a restart honours remaining backoff
+   * instead of immediately bursting retries.
    */
-  timeoutReason?: string;
-}
-
-export type OrphanReason = "removed_route" | "network_changed";
-
-export interface OrphanedJournalEntry {
-  entry: JournalEntry;
-  reason: OrphanReason;
-  /** Current resolved route chat ID for this entry's source, if any. */
-  currentChatId?: string;
-  /** Current configured network passphrase, if any. */
-  currentNetworkPassphrase?: string;
-}
-
-export interface JournalRecoveryContext {
-  /** Resolve the current route chat ID for a given entry source (empty = removed). */
-  resolveRouteChatId?: (source: string) => string;
-  /** Current Stellar network passphrase. */
-  networkPassphrase?: string;
-}
-
-export type OrphanDecision =
-  | { action: "discard" }
-  | { action: "reroute"; chatId?: string; networkPassphrase?: string };
-
-export interface OrphanRecoveryResult {
-  valid: JournalEntry[];
-  orphaned: OrphanedJournalEntry[];
-  discarded: number;
-  rerouted: number;
-  reroutedEntries: JournalEntry[];
+  nextAttemptAt?: number;
+  /** Number of failed delivery attempts recorded for this pending delivery. */
+  attempts?: number;
 }
 
 export interface SendJournalOptions {
@@ -124,7 +96,14 @@ export interface SendJournal {
     chatId?: string;
     networkPassphrase?: string;
     at: number;
+    nextAttemptAt?: number;
+    attempts?: number;
   }): Promise<void>;
+  /**
+   * Persist the next eligible retry time for a pending delivery so a restart
+   * does not immediately burst retries.
+   */
+  recordRetry(id: string, nextAttemptAt: number, attempts?: number): Promise<void>;
   recordDone(id: string): Promise<void>;
   /**
    * Record that a send attempt for `id` timed out before Telegram responded.
@@ -136,20 +115,31 @@ export interface SendJournal {
   /** Intents with no matching done: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   /**
-   * Pending intents that also have at least one matching `timeout` line.
-   * These are **confirmed-unknown outcomes**: the HTTP call reached Telegram's
-   * endpoint but the client did not receive a response, so the notification
-   * may have been accepted. Callers should not retry without de-duplication
-   * and must not claim exactly-once delivery.
+   * Pending deliveries whose `nextAttemptAt` is absent or `<= asOf`
+   * (defaults to the journal clock). Entries scheduled in the future are
+   * excluded until their retry time arrives.
    */
-  loadUnknownOutcomes(): Promise<JournalEntry[]>;
+  loadDue(asOf?: number): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
 }
 
-function entryKey(id: string, chatId?: string, topicId?: number): string {
-  if (chatId === undefined && topicId === undefined) return id;
-  return `${id}\0${chatId ?? ""}\0${topicId !== undefined ? String(topicId) : ""}`;
+/**
+ * Remaining wait time in milliseconds until `nextAttemptAt` is due.
+ * Returns `0` when `nextAttemptAt` is absent, non-finite, or already due.
+ */
+export function retryDelayMs(
+  nextAttemptAt: number | undefined,
+  asOf: number = Date.now(),
+): number {
+  if (typeof nextAttemptAt !== "number" || !Number.isFinite(nextAttemptAt)) return 0;
+  if (typeof asOf !== "number" || !Number.isFinite(asOf)) return 0;
+  return Math.max(0, nextAttemptAt - asOf);
+}
+
+function normalizeNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.floor(value);
 }
 
 function line(entry: JournalEntry): string {
@@ -241,8 +231,46 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     chatId?: string;
     networkPassphrase?: string;
     at: number;
+    nextAttemptAt?: number;
+    attempts?: number;
   }): Promise<void> {
-    await append({ kind: "intent", ...entry });
+    const nextAttemptAt = normalizeNonNegativeInt(entry.nextAttemptAt);
+    const attempts = normalizeNonNegativeInt(entry.attempts);
+    await append({
+      kind: "intent",
+      id: entry.id,
+      source: entry.source,
+      ledger: entry.ledger,
+      eventName: entry.eventName,
+      ...(entry.textHash !== undefined ? { textHash: entry.textHash } : {}),
+      at: entry.at,
+      ...(nextAttemptAt !== undefined ? { nextAttemptAt } : {}),
+      ...(attempts !== undefined ? { attempts } : {}),
+    });
+  }
+
+  async function recordRetry(
+    id: string,
+    nextAttemptAt: number,
+    attempts?: number,
+  ): Promise<void> {
+    const normalizedNext = normalizeNonNegativeInt(nextAttemptAt);
+    if (normalizedNext === undefined) {
+      throw new RangeError(
+        `nextAttemptAt must be a finite non-negative number, got ${String(nextAttemptAt)}`,
+      );
+    }
+    const normalizedAttempts = normalizeNonNegativeInt(attempts);
+    await append({
+      kind: "retry",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      at: now(),
+      nextAttemptAt: normalizedNext,
+      ...(normalizedAttempts !== undefined ? { attempts: normalizedAttempts } : {}),
+    });
   }
 
   async function recordDone(
@@ -270,58 +298,67 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     }
   }
 
-  async function recordTimeout(id: string, timeoutReason?: string): Promise<void> {
-    const entry: JournalEntry = {
-      kind: "timeout",
-      id,
-      source: "",
-      ledger: 0,
-      eventName: "",
-      at: now(),
-    };
-    if (typeof timeoutReason === "string" && timeoutReason.trim().length > 0) {
-      // Bound the reason string to avoid persisting unbounded remote payloads.
-      entry.timeoutReason = timeoutReason.slice(0, 200);
-    }
-    await append(entry);
-  }
-
-  async function loadPending(): Promise<JournalEntry[]> {
-    const entries = await readLines();
-    const settled = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
-    }
-    return entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
-  }
-
-  async function loadUnknownOutcomes(): Promise<JournalEntry[]> {
-    const entries = await readLines();
+  function resolvePending(entries: JournalEntry[]): JournalEntry[] {
     const done = new Set<string>();
     const timedOut = new Set<string>();
     for (const entry of entries) {
       if (entry.kind === "done") done.add(entry.id);
       if (entry.kind === "timeout") timedOut.add(entry.id);
     }
-    // Return pending intents that also have at least one timeout line:
-    // the send reached Telegram's endpoint but the response was not received.
-    return entries.filter(
-      (e) => e.kind === "intent" && !done.has(e.id) && timedOut.has(e.id),
-    );
+    const pending = new Map<string, JournalEntry>();
+    for (const entry of entries) {
+      if (done.has(entry.id)) continue;
+      if (entry.kind === "intent") {
+        const nextAttemptAt = normalizeNonNegativeInt(entry.nextAttemptAt);
+        const attempts = normalizeNonNegativeInt(entry.attempts);
+        pending.set(entry.id, {
+          kind: "intent",
+          id: entry.id,
+          source: entry.source,
+          ledger: entry.ledger,
+          eventName: entry.eventName,
+          ...(entry.textHash !== undefined ? { textHash: entry.textHash } : {}),
+          at: entry.at,
+          ...(nextAttemptAt !== undefined ? { nextAttemptAt } : {}),
+          ...(attempts !== undefined ? { attempts } : {}),
+        });
+      } else if (entry.kind === "retry") {
+        const nextAttemptAt = normalizeNonNegativeInt(entry.nextAttemptAt);
+        const attempts = normalizeNonNegativeInt(entry.attempts);
+        const existing = pending.get(entry.id);
+        if (existing) {
+          if (nextAttemptAt !== undefined) existing.nextAttemptAt = nextAttemptAt;
+          if (attempts !== undefined) existing.attempts = attempts;
+        } else {
+          pending.set(entry.id, {
+            kind: "intent",
+            id: entry.id,
+            source: entry.source ?? "",
+            ledger: entry.ledger ?? 0,
+            eventName: entry.eventName ?? "",
+            at: entry.at,
+            ...(nextAttemptAt !== undefined ? { nextAttemptAt } : {}),
+            ...(attempts !== undefined ? { attempts } : {}),
+          });
+        }
+      }
+    }
+    return [...pending.values()];
+  }
+
+  async function loadPending(): Promise<JournalEntry[]> {
+    return resolvePending(await readLines());
+  }
+
+  async function loadDue(asOf: number = now()): Promise<JournalEntry[]> {
+    const pending = await loadPending();
+    return pending.filter((entry) => retryDelayMs(entry.nextAttemptAt, asOf) === 0);
   }
 
   async function compact(): Promise<void> {
-    const entries = await readLines();
-    const settled = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
-    }
-    // A done line settles its intent: both lines (and any associated timeout
-    // lines for the same id) can be dropped. Keep only unresolved intents and
-    // their associated timeout lines so the unknown-outcome signal is preserved.
-    const unresolved = entries.filter(
-      (e) => (e.kind === "intent" || e.kind === "timeout") && !done.has(e.id),
-    );
+    // A done line settles its intent and any retry lines: all can be dropped.
+    // Unresolved intents are persisted with their latest nextAttemptAt/attempts.
+    const unresolved = resolvePending(await readLines());
     await persist(unresolved);
   }
 
@@ -344,5 +381,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, recordTimeout, loadPending, loadUnknownOutcomes, compact, stats };
+  return { recordIntent, recordRetry, recordDone, loadPending, loadDue, compact, stats };
 }
