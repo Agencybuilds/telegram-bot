@@ -1505,7 +1505,7 @@ export function decodeEvent(
         payload: {
           name: "unknown",
           eventName,
-          reason: `${eventName}: expected ${schema.expectedCount} topics, got ${event.topic.length}`,
+          reason: `${eventName}: invalid topic[] count (expected ${schema.expectedCount}, got ${event.topic.length})`,
         },
       };
     }
