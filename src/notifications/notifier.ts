@@ -208,10 +208,11 @@ export function routeStatus(activeRoutes: number): RouteStatus {
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
- * Sends suppressed by the empty-message guard, counted so callers (and the
- * empty-text tests) can prove a blank render never reached the Telegram API.
+ * Sends suppressed by notifier guards (empty render or route permission
+ * cooldown), counted so callers can prove a skipped send never reached the
+ * Telegram API.
  */
-export const notifierSkips = { emptyText: 0 };
+export const notifierSkips = { emptyText: 0, routeCooldown: 0 };
 
 // ── previewRouting ───────────────────────────────────────────────────────────
 
@@ -348,22 +349,39 @@ export function createNotifier(
   ): Promise<void> {
     const replyToMessageId = omitReplyTo ? undefined : extra?.replyToMessageId;
 
-    // Oversized payloads go out as ordered chunks under Telegram's limit. The
-    // thread reply rides on the first chunk and the explorer button on the
-    // last, so the message reads exactly like the unsplit one.
-    const parts = splitTelegramMessage(text);
-    if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
+    try {
+      // Oversized payloads go out as ordered chunks under Telegram's limit. The
+      // thread reply rides on the first chunk and the explorer button on the
+      // last, so the message reads exactly like the unsplit one.
+      const parts = splitTelegramMessage(text);
+      if (parts.length > 1) {
+        for (const [index, part] of parts.entries()) {
+          await bot.api.sendMessage(chatId, part, {
+            ...notificationOptions,
+            ...(index === parts.length - 1 && extra?.reply_markup
+              ? { reply_markup: extra.reply_markup }
+              : {}),
+            ...(index === 0 && extra?.replyToMessageId !== undefined
+              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+              : {}),
+          });
+        }
+        cooldowns.clearCooldown(chatId);
+        return;
+      }
+
+      try {
+        await bot.api.sendMessage(chatId, text, {
           ...notificationOptions,
-          ...threadOption,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
           ...(index === 0 && replyToMessageId !== undefined
             ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
             : {}),
         });
+        cooldowns.clearCooldown(chatId);
       }
       return;
     }
@@ -379,22 +397,15 @@ export function createNotifier(
       });
       return;
     } catch (err) {
-      // When the HTTP call timed out, the notification may have been accepted
-      // by Telegram even though the client received no response. Notify the
-      // caller so it can flag the pending journal intent as an unknown outcome
-      // rather than a confirmed rejection, before the error propagates.
-      if (isTimeoutError(err) && typeof extra?.onTimeout === "function") {
-        try {
-          extra.onTimeout(err);
-        } catch {
-          // onTimeout must never interrupt the error path.
+      if (isPermissionFailure(err)) {
+        const reason = safeErrorMessage(err, secrets);
+        const state = cooldowns.recordPermissionFailure(chatId, reason);
+        if (state) {
+          console.warn(
+            `[notifier] route entered permission cooldown for ${cooldownMs}ms` +
+              `${eventRefLabel(extra?.eventRef)}: ${reason}`,
+          );
         }
-      }
-      // A blank fallback is no fallback: sending whitespace-only text would
-      // just draw the same 400, so the original parse error propagates.
-      const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-        throw err;
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
       // category, and the caller-supplied event reference — never message
