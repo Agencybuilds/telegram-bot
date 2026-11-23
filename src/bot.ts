@@ -413,14 +413,19 @@ export function createBot(deps: BotDeps): Bot {
 export {
   classifyPermanentSendError,
   createNotifier,
-  isBotBlockedError,
-  isChatNotFoundError,
+  createSendLimiter,
+  DEFAULT_MAX_CONCURRENT_SENDS,
   isMarkdownParseError,
   isForumTopicClosed,
   notifierSkips,
-  PERMANENT_SEND_ERROR_CODES,
-  type PermanentSendErrorReason,
+  SendLimiterClosedError,
+  type Notifier,
+  type NotifierOptions,
   type SendExtra,
+  type SendLimiter,
+  type SendLimiterOptions,
+  type SendLimiterShutdownMode,
+  type SendLimiterStats,
 } from "./notifications/notifier.js";
 export {
   verifyRoutes,
