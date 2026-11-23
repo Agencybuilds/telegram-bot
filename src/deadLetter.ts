@@ -64,95 +64,11 @@ export interface DeadLetterStats {
   dropped: number;
 }
 
-export type DeadLetterReasonCategory =
-  | "rate_limited"
-  | "auth_error"
-  | "bad_request"
-  | "timeout"
-  | "network"
-  | "server_error"
-  | "unknown";
-
-export interface DeadLetterStatusSummary {
-  depth: number;
-  bySource: Record<string, number>;
-  byReason: Record<string, number>;
-  oldestEnqueuedAt: string | null;
-  newestEnqueuedAt: string | null;
-  maxAttemptsSeen: number;
-}
-
-/**
- * Map a persisted error string to a stable, destination-safe reason category
- * so operator status never leaks raw error payloads or chat identifiers.
- */
-export function classifyDeadLetterReason(
-  lastError: string | null | undefined,
-): DeadLetterReasonCategory {
-  if (!lastError || lastError.trim().length === 0) return "unknown";
-  const lower = lastError.toLowerCase();
-  if (/\b429\b|too many requests|retry after|rate[- ]limit/.test(lower)) {
-    return "rate_limited";
-  }
-  if (/\b40[13]\b|unauthorized|forbidden|blocked|kicked/.test(lower)) {
-    return "auth_error";
-  }
-  if (/\b40[04]\b|bad request|chat not found|can't parse|markdown|entity/.test(lower)) {
-    return "bad_request";
-  }
-  if (/timed? ?out|etimedout|esockettimedout|aborterror|\b408\b/.test(lower)) {
-    return "timeout";
-  }
-  if (/econnrefused|econnreset|enotfound|ehostunreach|eai_again|fetch failed|network|socket/.test(lower)) {
-    return "network";
-  }
-  if (/\b50[0234]\b|internal server error|bad gateway|service unavailable/.test(lower)) {
-    return "server_error";
-  }
-  return "unknown";
-}
-
-/**
- * Build a destination-safe summary of dead-letter entries containing counts
- * and reason categories only (never raw message text or destination ids).
- */
-export function summarizeDeadLetters(
-  entries: readonly DeadLetterEntry[],
-): DeadLetterStatusSummary {
-  const bySource: Record<string, number> = {};
-  const byReason: Record<string, number> = {};
-  let oldestEnqueuedAt: string | null = null;
-  let newestEnqueuedAt: string | null = null;
-  let maxAttemptsSeen = 0;
-
-  for (const entry of entries) {
-    const source = entry.source || "unknown";
-    bySource[source] = (bySource[source] ?? 0) + 1;
-
-    const reason = classifyDeadLetterReason(entry.lastError);
-    byReason[reason] = (byReason[reason] ?? 0) + 1;
-
-    if (entry.attempts > maxAttemptsSeen) {
-      maxAttemptsSeen = entry.attempts;
-    }
-    if (typeof entry.enqueuedAt === "string" && entry.enqueuedAt.length > 0) {
-      if (oldestEnqueuedAt === null || entry.enqueuedAt < oldestEnqueuedAt) {
-        oldestEnqueuedAt = entry.enqueuedAt;
-      }
-      if (newestEnqueuedAt === null || entry.enqueuedAt > newestEnqueuedAt) {
-        newestEnqueuedAt = entry.enqueuedAt;
-      }
-    }
-  }
-
-  return {
-    depth: entries.length,
-    bySource,
-    byReason,
-    oldestEnqueuedAt,
-    newestEnqueuedAt,
-    maxAttemptsSeen,
-  };
+export interface DeadLetterAckResult {
+  acknowledged: DeadLetterEntry[];
+  acknowledgedIds: string[];
+  unmatchedIds: string[];
+  remaining: number;
 }
 
 export interface DeadLetterQueueOptions {
@@ -181,133 +97,7 @@ export interface DeadLetterQueueOptions {
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
-export const DEAD_LETTER_CHECKPOINT_VERSION = 1;
-export const DEAD_LETTER_CHECKPOINT_MAX_IDS = 500;
-
-export interface DeadLetterRecoveryCheckpoint {
-  version: 1;
-  updatedAt: string;
-  acknowledgedIds: string[];
-  source?: string;
-  completed: boolean;
-}
-
-export interface RecoverSelectionOptions {
-  checkpointFile?: string;
-  source?: string;
-  budget?: number;
-  maxAcknowledgedIds?: number;
-  resetCheckpoint?: boolean;
-  signal?: AbortSignal;
-}
-
-export interface RecoverSelectionResult {
-  sent: number;
-  skippedAcknowledged: number;
-  remaining: number;
-  interrupted: boolean;
-  completed: boolean;
-  acknowledgedCount: number;
-}
-
-function boundAcknowledgedIds(ids: readonly string[], maxIds: number): string[] {
-  const cap = Math.max(1, maxIds);
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const id of ids) {
-    if (typeof id === "string" && id.length > 0 && !seen.has(id)) {
-      seen.add(id);
-      deduped.push(id);
-    }
-  }
-  if (deduped.length <= cap) return deduped;
-  return deduped.slice(deduped.length - cap);
-}
-
-/**
- * Load a persisted dead-letter recovery checkpoint, returning `null` if absent
- * or malformed. Enforces the bounded ID ceiling on load.
- */
-export async function loadRecoveryCheckpoint(
-  checkpointFile: string,
-  maxIds: number = DEAD_LETTER_CHECKPOINT_MAX_IDS,
-): Promise<DeadLetterRecoveryCheckpoint | null> {
-  let raw: string;
-  try {
-    raw = await readFile(checkpointFile, "utf8");
-  } catch {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as Partial<DeadLetterRecoveryCheckpoint>;
-    if (parsed.version !== DEAD_LETTER_CHECKPOINT_VERSION || !Array.isArray(parsed.acknowledgedIds)) {
-      return null;
-    }
-    return {
-      version: 1,
-      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
-      acknowledgedIds: boundAcknowledgedIds(parsed.acknowledgedIds, maxIds),
-      ...(typeof parsed.source === "string" && parsed.source.length > 0
-        ? { source: parsed.source }
-        : {}),
-      completed: parsed.completed === true,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** Atomically persist a bounded dead-letter recovery checkpoint. */
-export async function saveRecoveryCheckpoint(
-  checkpointFile: string,
-  checkpoint: DeadLetterRecoveryCheckpoint,
-  maxIds: number = DEAD_LETTER_CHECKPOINT_MAX_IDS,
-): Promise<void> {
-  const bounded: DeadLetterRecoveryCheckpoint = {
-    version: 1,
-    updatedAt: checkpoint.updatedAt,
-    acknowledgedIds: boundAcknowledgedIds(checkpoint.acknowledgedIds, maxIds),
-    ...(checkpoint.source ? { source: checkpoint.source } : {}),
-    completed: checkpoint.completed,
-  };
-  await mkdir(path.dirname(checkpointFile), { recursive: true });
-  const tmp = `${checkpointFile}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(bounded, null, 2)}\n`, "utf8");
-  await rename(tmp, checkpointFile);
-}
-
-/** Remove a dead-letter recovery checkpoint file if present. */
-export async function clearRecoveryCheckpoint(checkpointFile: string): Promise<void> {
-  await unlink(checkpointFile).catch(() => undefined);
-}
-
-export class DeadLetterMalformedError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = "DeadLetterMalformedError";
-  }
-}
-
-export class DeadLetterAccessError extends Error {
-  readonly code?: string;
-
-  constructor(message: string, code?: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = "DeadLetterAccessError";
-    this.code = code;
-  }
-}
-
-export interface DeadLetterLoadOptions {
-  /**
-   * When true, surface malformed files and non-ENOENT access errors instead of
-   * falling back to an empty queue. Used by the offline inspection CLI.
-   */
-  strict?: boolean;
-  /** Suppress informational `loaded ...` stdout logging (keeps CLI stdout machine-readable). */
-  quiet?: boolean;
-}
+export const DEAD_LETTER_MAX_ACK_IDS = 100;
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -766,11 +556,72 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     };
   }
 
+  /**
+   * Atomically acknowledge (remove) an explicit, bounded list of inspected
+   * dead-letter entry IDs. Unmatched IDs are reported and all non-matching
+   * queued entries are preserved untouched in their original order.
+   */
+  async function acknowledge(ids: readonly string[]): Promise<DeadLetterAckResult> {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new RangeError("acknowledge requires at least one entry id");
+    }
+    if (ids.length > DEAD_LETTER_MAX_ACK_IDS) {
+      throw new RangeError(
+        `acknowledge accepts at most ${DEAD_LETTER_MAX_ACK_IDS} entry ids (received ${ids.length})`,
+      );
+    }
+
+    const normalizedIds: string[] = [];
+    const requestedSet = new Set<string>();
+    for (const rawId of ids) {
+      if (typeof rawId !== "string" || rawId.trim() === "") {
+        throw new RangeError("acknowledge entry ids must be non-empty strings");
+      }
+      const id = rawId.trim();
+      if (!requestedSet.has(id)) {
+        requestedSet.add(id);
+        normalizedIds.push(id);
+      }
+    }
+
+    const acknowledged: DeadLetterEntry[] = [];
+    const kept: DeadLetterEntry[] = [];
+    const matchedSet = new Set<string>();
+
+    for (const entry of entries) {
+      if (requestedSet.has(entry.id)) {
+        acknowledged.push(entry);
+        matchedSet.add(entry.id);
+      } else {
+        kept.push(entry);
+      }
+    }
+
+    const unmatchedIds = normalizedIds.filter((id) => !matchedSet.has(id));
+
+    if (acknowledged.length > 0) {
+      entries = kept;
+      syncDepth();
+      await persist();
+      console.log(
+        `[dead-letter] acknowledged ${acknowledged.length} entry(s) ` +
+          `(${unmatchedIds.length} unmatched, ${entries.length} remaining)`,
+      );
+    }
+
+    return {
+      acknowledged: acknowledged.map((e) => ({ ...e })),
+      acknowledgedIds: acknowledged.map((e) => e.id),
+      unmatchedIds,
+      remaining: entries.length,
+    };
+  }
+
   return {
     load,
     enqueue,
     flush,
-    recoverSelection,
+    acknowledge,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },
