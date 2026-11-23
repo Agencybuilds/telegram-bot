@@ -720,12 +720,12 @@ change and must be deployed together with a recorded fixture and an operational
 note. The chain remains authoritative if the bot version cannot decode an event.
 
 RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
-endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
-explorer links. The client sends no signing material and creates no wallet.
-Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
-values are supported without changing cursor or decoder compatibility.
-Notifications only link `https:` URLs; any other explorer or app origin renders
-the `tx` label as inert text (see [docs/notification-links.md](docs/notification-links.md)).
+endpoint without embedded credentials (`user:pass@host` is rejected before
+startup, reporting only the affected configuration key), and
+`STELLAR_NETWORK_PASSPHRASE` controls network labeling for explorer links. The
+client sends no signing material and creates no wallet. Explorer path components
+are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL` values are supported without
+changing cursor or decoder compatibility.
 
 ## Cursor persistence
 

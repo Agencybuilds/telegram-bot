@@ -23,10 +23,8 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `SQUAD_CONTRACT_ID`: The Mimir squad Soroban contract address. Required. Must be a valid `C...` strkey.
 
 ### Network Settings
-- `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`).
-- `STELLAR_RPC_EGRESS_ALLOWLIST`: Optional comma-separated list of allowed RPC egress hosts, wildcards, or origins (e.g., `soroban-testnet.stellar.org,*.stellar.org`). When set, both initial RPC URLs and HTTP redirect destinations are validated against the allowlist, while credential-free loopback URLs (`127.0.0.1`, `localhost`, `::1`) remain permitted in `MIMIR_PROFILE=mock`.
-- `STELLAR_HORIZON_URL`: Used for generating transaction links.
-- `STELLAR_EXPLORER_BASE_URL`: Explorer origin for transaction links (default `https://stellar.expert/explorer`). Only `https:` origins become clickable links in notifications; see [notification-links.md](notification-links.md).
+- `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`). Must be a valid `http(s)` URL without embedded credentials (`user:pass@host`); invalid URLs fail fast before startup and report only the affected configuration key.
+- `STELLAR_HORIZON_URL`: Used for generating transaction links. Must be a valid `http(s)` URL without embedded credentials.
 - `STELLAR_NETWORK_PASSPHRASE`: Must match the RPC network's passphrase.
 
 ### Poller Tuning & Safeguards
