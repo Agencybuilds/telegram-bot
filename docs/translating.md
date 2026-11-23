@@ -46,6 +46,7 @@ All user-facing localization templates live in [`src/i18n.ts`](../src/i18n.ts). 
 | `NOTIFICATION_HTML` | **HTML** | Telegram HTML mirror of `NOTIFICATION_MD` (plus `fallbackEvent` and `previewModePrefix`), restricted to `<b>`, `<i>`, `<code>`, and `<a>` tags for `formatEventHtml()` in [`src/notifications/html.ts`](../src/notifications/html.ts). |
 | `EXPLORER_BUTTON_TEXT` | **Plain text** | Label on the inline keyboard button linking to Stellar Expert (`"View on Explorer"`). Inline button labels do not parse Markdown. |
 | `MIMIR_APP_BUTTON_TEXT` | **Plain text** | Label on the inline keyboard button that opens the Mimir web app (`"Open in Mimir"`), present only when `MIMIR_APP_URL` is configured. |
+| `CALLBACK_MESSAGES` | **Mixed** | Operator callback expired alert and recovery messages (`pauseExpiredAlert`, `pauseExpiredMessage`, `broadcastExpiredAlert`, `broadcastExpiredMessage`). Alert texts are plain text for `ctx.answerCallbackQuery({ show_alert: true })`; message texts use MarkdownV2 (`pauseExpiredMessage`) or plain text (`broadcastExpiredMessage`) for editing the prompt. |
 
 ### Why Both `NOTIFICATION_MD` and `NOTIFICATION_PLAIN` Exist
 

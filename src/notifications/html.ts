@@ -9,7 +9,6 @@
  * Every interpolated dynamic value goes through escapeHtml or escapeHtmlAttr.
  */
 
-import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
   shortAddress,
@@ -60,18 +59,33 @@ export function escapeHtmlAttr(url: string): string {
 }
 
 function usdcHtml(units: bigint): string {
-  return escapeHtml(`${formatUsdc(units)} USDC`);
+  return escapeHtml(isolateAmount(`${formatUsdc(units)} USDC`));
 }
 
 function whoHtml(address: string): string {
   return `<code>${escapeHtml(shortAddress(address))}</code>`;
 }
 
+/**
+ * Render `label` as an `<a>` link when `url` passes the shared link policy
+ * (`link-safety.ts`), otherwise as inert escaped text with no `href`.
+ */
+export function linkHtml(label: string, url: string | null | undefined): string {
+  const safe = safeLinkUrl(url);
+  if (!safe) return escapeHtml(label);
+  return `<a href="${escapeHtmlAttr(safe)}">${escapeHtml(label)}</a>`;
+}
+
+function txLinkHtml(config: StellarConfig, event: DecodedEvent): string | null {
+  const url = eventExplorerUrl(config, event);
+  if (url) return linkHtml("tx", url);
+  return eventTxHash(event) !== null ? escapeHtml("tx") : null;
+}
+
 function footerHtml(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeHtml(`ledger ${event.ledger}`);
-  const url = eventExplorerUrl(config, event);
-  if (!url) return `<i>${ledger}</i>`;
-  return `<i>${ledger}</i> · <a href="${escapeHtmlAttr(url)}">tx</a>`;
+  const tx = txLinkHtml(config, event);
+  return tx ? `<i>${ledger}</i> · ${tx}` : `<i>${ledger}</i>`;
 }
 
 /**
