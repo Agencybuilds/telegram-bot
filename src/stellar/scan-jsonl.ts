@@ -272,7 +272,38 @@ export async function* parseJsonlStream<T = unknown>(
  * line containing the histogram from {@link eventHistogram}, with a trailing
  * `\n` regardless of host operating system.
  */
-export function formatScanJsonl(events: readonly DecodedEvent[]): string {
+export function formatScanJsonl(
+  events: readonly DecodedEvent[],
+  options: FormatScanJsonlOptions = {},
+): string {
+  const { metadata, expectedNetwork, expectedContractId } = options;
+
+  if (expectedNetwork !== undefined && metadata?.network !== undefined && metadata.network !== expectedNetwork) {
+    throw new ArchiveMetadataConflictError(
+      `Scan network "${metadata.network}" contradicts expected network "${expectedNetwork}"`,
+    );
+  }
+  if (
+    expectedContractId !== undefined &&
+    metadata?.contractId !== undefined &&
+    metadata.contractId !== expectedContractId
+  ) {
+    throw new ArchiveMetadataConflictError(
+      `Scan contractId "${metadata.contractId}" contradicts expected contractId "${expectedContractId}"`,
+    );
+  }
+
+  const effectiveContractId = expectedContractId ?? metadata?.contractId;
+  if (effectiveContractId !== undefined) {
+    for (const event of events) {
+      if (event.contractId !== effectiveContractId) {
+        throw new ArchiveMetadataConflictError(
+          `Event contractId "${event.contractId}" contradicts expected contractId "${effectiveContractId}"`,
+        );
+      }
+    }
+  }
+
   const lines: string[] = [];
   for (const event of events) {
     lines.push(JSON.stringify({ type: "event", ...event }, scanJsonReplacer));
