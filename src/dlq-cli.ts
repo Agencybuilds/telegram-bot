@@ -26,6 +26,7 @@
  *   - 4: dead-letter file access or I/O failure
  */
 
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
@@ -37,6 +38,7 @@ import {
   DeadLetterAccessError,
   DeadLetterMalformedError,
   type DeadLetterEntry,
+  type DeadLetterIncidentBundle,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
@@ -50,7 +52,7 @@ export const DLQ_EXIT_CODES = {
 } as const;
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]|bundle [--out PATH]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = DLQ_EXIT_CODES.USAGE;
@@ -91,6 +93,10 @@ export interface PurgeDlqOptions extends ListDlqOptions {
   olderThan?: string | number;
   olderThanMs?: number;
   yes?: boolean;
+}
+
+export interface ExportBundleOptions extends ListDlqOptions {
+  outFile?: string;
 }
 
 export interface PurgeDlqResult {
@@ -420,9 +426,45 @@ async function persistPurgedQueue(
   }, budget);
 }
 
+/**
+ * Export a redacted dead-letter incident bundle with queue metadata and stable
+ * reason codes, omitting bot credentials and private destination identifiers.
+ */
+export async function exportDeadLetterBundle(
+  options: ExportBundleOptions,
+): Promise<DeadLetterIncidentBundle> {
+  const queue = openQueue(options);
+  await queue.load();
+  const rawBundle = queue.incidentBundle();
+  const chatIds = configuredChatIds(options.chatId);
+  const secrets = configuredSecrets(options.secrets);
+
+  const sanitized: DeadLetterIncidentBundle = {
+    schemaVersion: rawBundle.schemaVersion,
+    exportedAt: rawBundle.exportedAt,
+    queue: rawBundle.queue,
+    entries: rawBundle.entries.map((entry) => ({
+      ...entry,
+      id: sanitizeDlqText(entry.id, chatIds, secrets),
+      source: sanitizeDlqText(entry.source, chatIds, secrets),
+      eventName: sanitizeDlqText(entry.eventName, chatIds, secrets),
+    })),
+  };
+
+  if (options.outFile) {
+    await mkdir(path.dirname(options.outFile), { recursive: true });
+    const tmp = `${options.outFile}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(sanitized, null, 2)}\n`, "utf8");
+    await rename(tmp, options.outFile);
+  }
+
+  return sanitized;
+}
+
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "bundle";
   file?: string;
+  out?: string;
   id?: string;
   olderThan?: string;
   yes: boolean;
@@ -432,7 +474,12 @@ interface ParsedCliArgs {
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge" &&
+    subcommand !== "bundle"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
@@ -463,9 +510,12 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id" || arg === "--out") {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
+      }
+      if (arg === "--out" && subcommand !== "bundle") {
+        throw new DlqUsageError(`--out is only valid with bundle\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -476,6 +526,7 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
       else if (arg === "--chat-id") parsed.chatId = value;
+      else if (arg === "--out") parsed.out = value;
       i += 1;
       continue;
     }
@@ -616,12 +667,26 @@ export async function runDlqCli(
       return { exitCode: 0 };
     }
 
-    const result = await purgeDeadLetters({
+    if (parsed.subcommand === "purge") {
+      const result = await purgeDeadLetters({
+        ...commonOptions,
+        olderThan: parsed.olderThan,
+        yes: parsed.yes,
+      });
+      out(formatPurgeOutput(result, filePath, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
+    const outFile = parsed.out ? resolvePath(parsed.out) : undefined;
+    const bundle = await exportDeadLetterBundle({
       ...commonOptions,
-      olderThan: parsed.olderThan,
-      yes: parsed.yes,
+      outFile,
     });
-    out(formatPurgeOutput(result, filePath, parsed.json).trimEnd());
+    if (outFile && !parsed.json) {
+      out(`[dlq] exported incident bundle (depth=${bundle.queue.depth}) to ${outFile}`);
+    } else {
+      out(JSON.stringify(bundle, null, 2));
+    }
     return { exitCode: 0 };
   } catch (err) {
     if (err instanceof DlqUsageError) {
