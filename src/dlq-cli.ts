@@ -80,6 +80,7 @@ export interface ListDlqOptions {
   secrets?: readonly string[];
   maxEntries?: number;
   maxAttempts?: number;
+  maxAgeMs?: number | null;
   now?: () => number;
 }
 
@@ -308,10 +309,19 @@ function openQueue(options: ListDlqOptions) {
       ? Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)
       : DEAD_LETTER_MAX_ATTEMPTS);
 
+  const maxAgeMs =
+    options.maxAgeMs !== undefined
+      ? options.maxAgeMs
+      : Number.isInteger(Number(process.env.DEAD_LETTER_MAX_AGE_MS)) &&
+          Number(process.env.DEAD_LETTER_MAX_AGE_MS) >= 1
+        ? Number(process.env.DEAD_LETTER_MAX_AGE_MS)
+        : null;
+
   return createDeadLetterQueue({
     filePath: options.filePath,
     maxEntries,
     maxAttempts,
+    maxAgeMs,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
     strict: true,
@@ -329,6 +339,14 @@ export async function getDeadLetterStatus(
 
 /** Load and return all dead-letter entries with redacted chat ids. */
 export async function listDeadLetters(options: ListDlqOptions): Promise<DlqEntryView[]> {
+  const { entries } = await inspectDeadLetters(options);
+  return entries;
+}
+
+export async function inspectDeadLetters(options: ListDlqOptions): Promise<{
+  entries: DlqEntryView[];
+  expired: number;
+}> {
   const queue = openQueue(options);
   await queue.load({ strict: true, quiet: true });
   return queue.snapshot().map((entry) => toEntryView(entry, options));
@@ -556,6 +574,7 @@ async function persistPurgedQueue(
       options.maxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS,
       highestAttempts + 2,
     ),
+    maxAgeMs: null,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
   });
@@ -801,41 +820,21 @@ function formatListOutput(
   filePath: string,
   chatId: string,
   asJson: boolean,
-  nowMs: number,
+  expired = 0,
 ): string {
   const ageSummary = summarizeDeadLetterAge(entries, nowMs);
   const oldestAge = formatAgeLabel(ageSummary.ageMs);
 
   if (asJson) {
-    return `${JSON.stringify(
-      {
-        file: filePath,
-        chatId,
-        depth: entries.length,
-        oldestEnqueuedAt: ageSummary.oldestEnqueuedAt,
-        oldestAgeMs: ageSummary.ageMs,
-        oldestAge,
-        missingTimestamps: ageSummary.missingTimestamps,
-        entries,
-      },
-      null,
-      2,
-    )}\n`;
+    return `${JSON.stringify({ file: filePath, chatId, depth: entries.length, expired, entries }, null, 2)}\n`;
   }
   if (entries.length === 0) {
-    return `[dlq] 0 entries (chat=${chatId}) in ${filePath}`;
+    const expiredNote = expired > 0 ? `, expired=${expired}` : "";
+    return `[dlq] 0 entries (chat=${chatId}${expiredNote}) in ${filePath}`;
   }
-  const missingSuffix =
-    ageSummary.missingTimestamps > 0
-      ? `, ${ageSummary.missingTimestamps} missing timestamp(s)`
-      : "";
-  const agePart =
-    oldestAge !== null
-      ? `age=${oldestAge}${missingSuffix}`
-      : `age=unknown (missing legacy timestamp${ageSummary.missingTimestamps > 1 ? "s" : ""})`;
-
+  const expiredNote = expired > 0 ? `, expired=${expired}` : "";
   const lines = [
-    `[dlq] ${entries.length} entry(s) (chat=${chatId}, ${agePart}) in ${filePath}`,
+    `[dlq] ${entries.length} entry(s) (chat=${chatId}${expiredNote}) in ${filePath}`,
     ...entries.map(
       (e) =>
         `  ${e.id}  enqueued=${e.enqueuedAt ?? "unknown"}  source=${e.source}  ledger=${e.ledger}  ` +
@@ -993,9 +992,9 @@ export async function runDlqCli(
     }
 
     if (parsed.subcommand === "list") {
-      const entries = await listDeadLetters(commonOptions);
+      const { entries, expired } = await inspectDeadLetters(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);
-      out(formatListOutput(entries, filePath, chatId, parsed.json, nowMs).trimEnd());
+      out(formatListOutput(entries, filePath, chatId, parsed.json, expired).trimEnd());
       return { exitCode: 0 };
     }
 

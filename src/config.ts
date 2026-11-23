@@ -348,6 +348,8 @@ export interface BotConfig extends StellarConfig {
   deadLetterMax: number;
   /** Replay attempts before a parked send is dropped as poison. */
   deadLetterMaxAttempts: number;
+  /** Maximum retention age (ms) for parked sends before expiry. */
+  deadLetterMaxAgeMs?: number;
   /**
    * Crash-safe send journal: intent is logged before a Telegram send and done
    * after, so a restart can tell which notifications may have been sent
@@ -469,6 +471,7 @@ const DEFAULTS = {
   deadLetterFile: "./data/dead-letter.json",
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
+  deadLetterMaxAgeMs: 7 * 24 * 60 * 60 * 1_000,
   sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
@@ -1184,6 +1187,11 @@ export function loadConfig(): BotConfig {
       DEFAULTS.deadLetterMaxAttempts,
       1,
     ),
+    deadLetterMaxAgeMs: c.int(
+      "DEAD_LETTER_MAX_AGE_MS",
+      DEFAULTS.deadLetterMaxAgeMs,
+      1,
+    ),
     sendJournalFile: path.resolve(
       process.cwd(),
       read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
@@ -1515,6 +1523,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX_ATTEMPTS", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_MAX_AGE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {
     key: "HEALTH_PORT",
