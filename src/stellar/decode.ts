@@ -34,9 +34,13 @@ import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 import { redactText } from "../redact.js";
 import { peekEventName } from "./peek.js";
-import type { EventQuarantine } from "./quarantine.js";
+import {
+  DEPTH_LIMIT_REASON,
+  MAX_DECODED_COLLECTION_DEPTH,
+  scValCollectionDepth,
+} from "./generic-decode.js";
 
-export { peekEventName, getGenericDecoderCapabilityReport };
+export { peekEventName, DEPTH_LIMIT_REASON, MAX_DECODED_COLLECTION_DEPTH, scValCollectionDepth };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -53,11 +57,11 @@ export interface DecodeOptions {
    */
   shouldDecode?: (name: string) => boolean;
   /**
-   * Optional quarantine instance to preserve undecodable event envelopes.
-   * When provided and an event cannot be decoded (malformed XDR or unknown
-   * payload), the raw envelope and source identity are preserved to the quarantine.
+   * Maximum nested vec/map collection depth, in `event.value` or any topic.
+   * Defaults to {@link MAX_DECODED_COLLECTION_DEPTH}. Deeper events become
+   * `unknown` with reason {@link DEPTH_LIMIT_REASON} before native conversion.
    */
-  quarantine?: EventQuarantine;
+  maxDepth?: number;
 }
 
 export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
@@ -67,6 +71,12 @@ export function normalizeContractVersion(raw?: string): string {
   if (!raw) return DEFAULT_CONTRACT_VERSION;
   const v = raw.trim().toLowerCase();
   return v || DEFAULT_CONTRACT_VERSION;
+}
+
+/** A finite, non-negative depth bound; malformed overrides fall back to the default. */
+export function normalizeMaxDepth(raw?: number): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return MAX_DECODED_COLLECTION_DEPTH;
+  return Math.max(0, Math.floor(raw));
 }
 
 /** 1 USDC in atomic units. */
@@ -1488,33 +1498,16 @@ export function decodeEvent(
       return handleUndecodable("topic[0] is not an event name string", eventName);
     }
 
-    // Validate topic count before accessing variant positions or parsing payload.
-    if (event.topic.length > MAX_EVENT_TOPICS) {
-      recordDecodeOutcome(source, eventName, "malformed");
-      return {
-        ...meta,
-        payload: {
-          name: "unknown",
-          eventName,
-          reason: `${eventName}: topic count ${event.topic.length} exceeds maximum of ${MAX_EVENT_TOPICS}`,
-        },
-      };
-    }
-
-    const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
-    const schema = Object.prototype.hasOwnProperty.call(schemas, eventName)
-      ? schemas[eventName]
-      : undefined;
-    if (schema && event.topic.length !== schema.expectedCount) {
-      recordDecodeOutcome(source, eventName, "malformed");
-      return {
-        ...meta,
-        payload: {
-          name: "unknown",
-          eventName,
-          reason: `${eventName}: invalid topic[] count (expected ${schema.expectedCount}, got ${event.topic.length})`,
-        },
-      };
+    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
+    const maxDepth = normalizeMaxDepth(opts?.maxDepth);
+    // Depth is checked independently of XDR byte size: a handful of nested
+    // collections is small on the wire but can still exhaust native recursion.
+    // This probe never serializes or converts the value, so it is safe first.
+    if (
+      scValCollectionDepth(event.value, maxDepth) > maxDepth ||
+      rawTopics.some((topic) => scValCollectionDepth(topic, maxDepth) > maxDepth)
+    ) {
+      throw new DecodeError(DEPTH_LIMIT_REASON);
     }
 
     // If caller provided shouldDecode, and it returned false, and the event is neither admin nor unknown:
@@ -1528,7 +1521,6 @@ export function decodeEvent(
       }
     }
 
-    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
     const topics = rawTopics.map((t) => {
       try {
         return native(t as xdr.ScVal);
